@@ -1,17 +1,17 @@
 [package]
-name = "testhashers"
+name = "hashevals"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
 description = "Minimalistic Rust toolkit for hash function quality analysis. Tests avalanche effect, differential patterns, and statistical distribution across variable-length n-grams."
 license = "Apache-2.0"
-repository = "https://github.com/your-username/TestHashers"
+repository = "https://github.com/ashvardanian/HashEvals"
 keywords = ["hash", "crypto", "benchmark", "avalanche", "testing"]
 categories = ["algorithms", "cryptography", "development-tools"]
 readme = "README.md"
 
 [[bin]]
-name = "testhashers"
+name = "hashevals"
 path = "main.rs"
 
 [dependencies]

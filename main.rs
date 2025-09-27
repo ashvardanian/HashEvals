@@ -1,5 +1,5 @@
 #![doc = r#"
-# TestHashers: Comprehensive Hash Function Quality Testing
+# HashEvals: Minimalistic Hash Function Quality Testing Suite
 
 This toolkit implements rigorous hash function quality tests inspired by SMHasher and SMHasher3,
 focusing on avalanche effect, differential analysis, and distribution quality.
@@ -52,7 +52,10 @@ use fork_union as fu;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
-use tabled::{settings::{Style, Alignment}, Table, Tabled};
+use tabled::{
+    settings::{Alignment, Style},
+    Table, Tabled,
+};
 
 use hash_functions::{
     get_all_hash_functions, get_available_hash_names, get_hash_functions_by_names, HashFunction,
@@ -326,103 +329,91 @@ where
     }
 }
 
-/// Atomic bitset for collision detection (4GB = 2^32 bits)
-struct AtomicBitSet {
-    // Use u64 chunks for atomic operations, each covering 64 bits
-    chunks: Vec<AtomicU64>,
-}
-
-impl AtomicBitSet {
-    fn new() -> Self {
-        // 2^32 bits = 2^29 u64 chunks (512MB)
-        let num_chunks = (1u64 << 32) / 64;
-        let mut chunks = Vec::with_capacity(num_chunks as usize);
-        for _ in 0..num_chunks {
-            chunks.push(AtomicU64::new(0));
-        }
-        Self { chunks }
-    }
-
-    /// Test and set a bit atomically. Returns true if bit was already set (collision)
-    fn test_and_set(&self, bit_index: u32) -> bool {
-        let chunk_index = (bit_index / 64) as usize;
-        let bit_offset = bit_index % 64;
-        let bit_mask = 1u64 << bit_offset;
-
-        if chunk_index >= self.chunks.len() {
-            return false; // Out of bounds
-        }
-
-        let old_value = self.chunks[chunk_index].fetch_or(bit_mask, Ordering::Relaxed);
-        (old_value & bit_mask) != 0 // Return true if bit was already set
-    }
-}
-
-/// Test for u32 collisions in sequential integer inputs
-pub fn test_u32_collisions<F>(
+/// Test for integral collisions using sample-sized bitset and random inputs
+pub fn test_integral_collisions<F>(
     thread_pool: &mut fu::ThreadPool,
     hash_function: F,
-    max_samples: usize,
-) -> CollisionResults
+    ngram_size: usize,
+    num_samples: usize,
+) -> Option<CollisionResults>
 where
     F: Fn(&[u8]) -> u64 + Send + Sync,
 {
-    // Expected collision point using birthday paradox: ~sqrt(2^32) ≈ 65,536
-    let expected_collision_at = ((1u64 << 32) as f64).sqrt() as usize * 2; // ~131k with some margin
+    // Only run for N-gram sizes ≤ 8 bytes
+    if ngram_size > 8 {
+        return None;
+    }
 
-    // Create atomic bitset for collision detection
-    let bitset = AtomicBitSet::new();
+    // Expected collision point using birthday paradox for sample space
+    let expected_collision_at = ((num_samples as f64).sqrt() * 1.2533) as usize; // √(π/2) * √n
+
+    // Generate random u64 values with only lower N bytes populated
+    let mut rng = ChaCha20Rng::seed_from_u64(123456);
+    let test_inputs: Vec<u64> = (0..num_samples)
+        .map(|_| {
+            let val = rng.random::<u64>();
+            // Mask to only use lower N bytes
+            let mask = if ngram_size >= 8 {
+                u64::MAX
+            } else {
+                (1u64 << (ngram_size * 8)) - 1
+            };
+            val & mask
+        })
+        .collect();
+
+    // Create atomic bitset of sample size
+    let bitset_chunks = (num_samples + 63) / 64; // Round up to nearest u64
+    let bitset: Vec<AtomicU64> = (0..bitset_chunks).map(|_| AtomicU64::new(0)).collect();
 
     // Atomic counters for collision detection
-    let total_collisions = AtomicU64::new(0); // Total collision count
-    let first_collision = AtomicU64::new(u64::MAX); // Index of first collision
-    let collision_value = AtomicU64::new(0); // The hash value that collided
+    let total_collisions = AtomicU64::new(0);
+    let first_collision = AtomicU64::new(u64::MAX);
 
-    thread_pool.for_n(max_samples, |worker_context| {
+    thread_pool.for_n(num_samples, |worker_context| {
         let i = worker_context.task_index;
+        let input_val = test_inputs[i];
 
-        // Hash the integer as little-endian bytes
-        let input_bytes = (i as u64).to_le_bytes();
+        // Convert to bytes for hashing (little-endian, only N bytes)
+        let input_bytes = input_val.to_le_bytes();
         let hash_val = hash_function(&input_bytes);
-        let low32 = hash_val as u32;
 
-        // Test and set bit atomically
-        if bitset.test_and_set(low32) {
-            // Collision detected! Increment total count
-            total_collisions.fetch_add(1, Ordering::Relaxed);
+        // Map hash to bitset position using modulo
+        let bit_index = (hash_val % num_samples as u64) as usize;
+        let chunk_index = bit_index / 64;
+        let bit_offset = bit_index % 64;
+        let bit_mask = 1u64 << bit_offset;
 
-            // Record if this is the first collision
-            let current_first = first_collision.load(Ordering::Relaxed);
-            if (i as u64) < current_first {
-                first_collision.store(i as u64, Ordering::Relaxed);
-                collision_value.store(low32 as u64, Ordering::Relaxed);
-            }
+        assert!(chunk_index < bitset.len());
+        let old_value = bitset[chunk_index].fetch_or(bit_mask, Ordering::Relaxed);
+
+        // Check if bit was already set (collision)
+        if (old_value & bit_mask) == 0 {
+            return;
         }
+        total_collisions.fetch_add(1, Ordering::Relaxed);
+        first_collision.fetch_min(i as u64, Ordering::Relaxed);
     });
 
     let total_collision_count = total_collisions.load(Ordering::Relaxed) as usize;
     let first_collision_idx = first_collision.load(Ordering::Relaxed);
-    let collision_val = collision_value.load(Ordering::Relaxed);
 
-    let (first_collision_at, collision_value_opt) = if first_collision_idx == u64::MAX {
-        (None, None)
+    let first_collision_at = if first_collision_idx == u64::MAX {
+        None
     } else {
-        (
-            Some(first_collision_idx as usize),
-            Some(collision_val as u32),
-        )
+        Some(first_collision_idx as usize)
     };
 
-    let collision_rate = total_collision_count as f64 / max_samples as f64;
+    let collision_rate = total_collision_count as f64 / num_samples as f64;
 
-    CollisionResults {
+    Some(CollisionResults {
         total_collisions: total_collision_count,
         first_collision_at,
-        collision_value: collision_value_opt,
+        collision_value: None, // Not used meaningfully
         expected_collision_at,
-        total_tests: max_samples,
+        total_tests: num_samples,
         collision_rate,
-    }
+    })
 }
 
 /// Optimized parallel bucket distribution uniformity analysis
@@ -523,9 +514,9 @@ struct DetailedTestResult {
     ngrams_tested: usize,
     #[tabled(rename = "Avalanche Bias")]
     avalanche_bias_display: String,
-    #[tabled(rename = "u32 ⨳")]
+    #[tabled(rename = "Integral ⨳")]
     total_collisions: usize,
-    #[tabled(rename = "First Collision")]
+    #[tabled(rename = "1st Collision")]
     first_collision_display: String,
     #[tabled(rename = "Chi²")]
     distribution_score_display: String,
@@ -549,7 +540,7 @@ struct TestResult {
     avg_bias_display: String,
     #[tabled(rename = "Worst.Bias")]
     worst_bias_display: String,
-    #[tabled(rename = "u32 ⨳")]
+    #[tabled(rename = "Integral ⨳")]
     total_collisions: usize,
     #[tabled(rename = "Chi²")]
     avg_chi_square_display: String,
@@ -663,65 +654,52 @@ fn test_hash_functions_tabular(
             print!("  Testing {}...", hash_func.name());
 
             // Run tests based on bit width
-            let (avalanche, collisions, distribution, actual_samples) = if hash_func.bits() == 64 {
-                let aval = test_avalanche(
-                    &mut pool,
-                    |d| hash_func.hash(d),
-                    *ngram_size,
-                    effective_samples,
-                );
-                // Only run collision tests for 4-grams
-                let collisions = if *ngram_size == 4 {
-                    test_u32_collisions(&mut pool, |d| hash_func.hash(d), effective_samples)
+            let (avalanche, collisions_opt, distribution, actual_samples) =
+                if hash_func.bits() == 64 {
+                    let aval = test_avalanche(
+                        &mut pool,
+                        |d| hash_func.hash(d),
+                        *ngram_size,
+                        effective_samples,
+                    );
+                    let collisions_opt = test_integral_collisions(
+                        &mut pool,
+                        |d| hash_func.hash(d),
+                        *ngram_size,
+                        effective_samples,
+                    );
+                    let dist = test_buckets_distribution(
+                        &mut pool,
+                        |d| hash_func.hash(d),
+                        *ngram_size,
+                        effective_samples * 10,
+                        1024,
+                    );
+                    let samples = effective_samples.min(dist.bucket_count * 10); // Actual samples tested
+                    (aval, collisions_opt, dist, samples)
                 } else {
-                    CollisionResults {
-                        total_collisions: 0,
-                        first_collision_at: None,
-                        collision_value: None,
-                        expected_collision_at: 0,
-                        total_tests: 0,
-                        collision_rate: 0.0,
-                    }
+                    let aval = test_avalanche(
+                        &mut pool,
+                        |d| hash_func.hash(d) as u32,
+                        *ngram_size,
+                        effective_samples,
+                    );
+                    let collisions_opt = test_integral_collisions(
+                        &mut pool,
+                        |d| hash_func.hash(d),
+                        *ngram_size,
+                        effective_samples,
+                    );
+                    let dist = test_buckets_distribution(
+                        &mut pool,
+                        |d| hash_func.hash(d) as u32,
+                        *ngram_size,
+                        effective_samples * 10,
+                        1024,
+                    );
+                    let samples = effective_samples.min(dist.bucket_count * 10);
+                    (aval, collisions_opt, dist, samples)
                 };
-                let dist = test_buckets_distribution(
-                    &mut pool,
-                    |d| hash_func.hash(d),
-                    *ngram_size,
-                    effective_samples * 10,
-                    1024,
-                );
-                let samples = effective_samples.min(dist.bucket_count * 10); // Actual samples tested
-                (aval, collisions, dist, samples)
-            } else {
-                let aval = test_avalanche(
-                    &mut pool,
-                    |d| hash_func.hash(d) as u32,
-                    *ngram_size,
-                    effective_samples,
-                );
-                // Only run collision tests for 4-grams
-                let collisions = if *ngram_size == 4 {
-                    test_u32_collisions(&mut pool, |d| hash_func.hash(d), effective_samples)
-                } else {
-                    CollisionResults {
-                        total_collisions: 0,
-                        first_collision_at: None,
-                        collision_value: None,
-                        expected_collision_at: 0,
-                        total_tests: 0,
-                        collision_rate: 0.0,
-                    }
-                };
-                let dist = test_buckets_distribution(
-                    &mut pool,
-                    |d| hash_func.hash(d) as u32,
-                    *ngram_size,
-                    effective_samples * 10,
-                    1024,
-                );
-                let samples = effective_samples.min(dist.bucket_count * 10);
-                (aval, collisions, dist, samples)
-            };
 
             // Show detailed stats immediately if verbose mode
             if verbose {
@@ -749,45 +727,59 @@ fn test_hash_functions_tabular(
                     best_bit.0, best_bit.1, worst_bit.0, worst_bit.1
                 );
                 println!("    └─ Distribution: Chi²={:.3}", distribution.chi_square);
-                if collisions.total_collisions > 0 {
-                    match collisions.first_collision_at {
-                        Some(pos) => println!(
-                            "    └─ u32 ⨳: {} collisions, first at {} (expected at √n ~ {})",
-                            collisions.total_collisions, pos, collisions.expected_collision_at
-                        ),
-                        None => {
-                            println!(
-                                "    └─ u32 ⨳: {} collisions",
-                                collisions.total_collisions
-                            )
+                if let Some(collisions) = &collisions_opt {
+                    if collisions.total_collisions > 0 {
+                        match collisions.first_collision_at {
+                            Some(pos) => println!(
+                                "    └─ Integral ⨳: {} collisions, first at {} (expected at ~{})",
+                                collisions.total_collisions, pos, collisions.expected_collision_at
+                            ),
+                            None => {
+                                println!(
+                                    "    └─ Integral ⨳: {} collisions",
+                                    collisions.total_collisions
+                                )
+                            }
                         }
+                    } else {
+                        println!(
+                            "    └─ Integral ⨳: No collisions in {} samples",
+                            collisions.total_tests
+                        );
                     }
                 } else {
-                    println!(
-                        "    └─ u32 ⨳: No collisions in {} samples",
-                        collisions.total_tests
-                    );
+                    println!("    └─ Integral ⨳: Skipped (N-gram size > 8)");
                 }
             } else {
                 println!(" done");
             }
 
-            let collision_display = match collisions.first_collision_at {
-                Some(pos) => format!("@{}", pos),
-                None => "None".to_string(),
-            };
+            let (total_collisions, collision_display, total_collisions_count) =
+                if let Some(collisions) = &collisions_opt {
+                    let display = match collisions.first_collision_at {
+                        Some(pos) => format!("@{}", pos),
+                        None => "None".to_string(),
+                    };
+                    (
+                        collisions.total_collisions,
+                        display,
+                        collisions.total_collisions,
+                    )
+                } else {
+                    (0, "N/A".to_string(), 0)
+                };
 
             detailed_results.push(DetailedTestResult {
                 hash_name: hash_func.name().to_string(),
                 ngram_size: *ngram_size,
                 ngrams_tested: actual_samples,
                 avalanche_bias_display: format!("{:.5}%", avalanche.worst_bias),
-                total_collisions: collisions.total_collisions,
+                total_collisions,
                 first_collision_display: collision_display,
                 distribution_score_display: format!("{:.3}", distribution.chi_square),
                 avalanche_bias: avalanche.worst_bias,
                 distribution_score: distribution.chi_square,
-                total_collisions_count: collisions.total_collisions,
+                total_collisions_count,
             });
         }
     }
@@ -802,7 +794,10 @@ fn test_hash_functions_tabular(
 
     let table = Table::new(&aggregated_results)
         .with(Style::psql())
-        .modify(tabled::settings::object::Columns::new(1..5), Alignment::right())
+        .modify(
+            tabled::settings::object::Columns::new(1..5),
+            Alignment::right(),
+        )
         .to_string();
     println!("{}", table);
 
@@ -862,14 +857,17 @@ fn test_hash_functions_tabular(
     println!();
     let summary_table = Table::new(&ngram_summaries)
         .with(Style::psql())
-        .modify(tabled::settings::object::Columns::new(2..5), Alignment::right())
+        .modify(
+            tabled::settings::object::Columns::new(2..5),
+            Alignment::right(),
+        )
         .to_string();
     println!("{}", summary_table);
 }
 
 /// Command line arguments
 #[derive(Parser)]
-#[command(name = "testhashers")]
+#[command(name = "hashevals")]
 #[command(about = "Hash Function Quality Testing Laboratory")]
 #[command(version)]
 struct Args {
@@ -919,7 +917,7 @@ fn main() {
         return;
     }
 
-    println!("TestHashers: Hash Function Quality Laboratory");
+    println!("HashEvals: Minimalistic Hash Function Quality Testing Suite");
     println!("=============================================");
     println!("Testing hash functions on n-grams from continuous random buffer");
     println!();
@@ -972,11 +970,13 @@ fn main() {
         args.csv_output.as_deref(),
     );
 
-    println!("\nNotes:");
+    println!();
+    println!("Notes:");
     println!("- Avalanche bias: <0.1% (excellent), <0.5% (very good), <1.0% (good)");
     println!("- Chi²: Lower values indicate better distribution uniformity");
-    println!("- u32 ⨳: Tests low 32-bits on sequential integers [0,1,2,...] (only for 4-grams)");
-    println!("  Expected first collision ~√(2³²) ≈ 65,536 by birthday paradox");
-    println!("  Early collisions (<10k) suggest hash weakness, late (>500k) suggest bias");
-    println!("- Crc32 is expected to have poor avalanche (not designed for it)");
+    println!(
+        "- Integral ⨳: Collisions on random N-byte little-endian uints (only for N ≤ 8)"
+    );
+    println!("  Expected collision ~√(π/2) × √samples by birthday paradox");
+    println!("  Uses sample-sized bitset with hash % sample_size mapping");
 }

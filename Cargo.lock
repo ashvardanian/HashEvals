@@ -429,6 +429,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashevals"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "blake3",
+ "cityhash",
+ "clap 4.5.48",
+ "crc32fast",
+ "csv",
+ "fork_union",
+ "gxhash",
+ "murmur3",
+ "rand",
+ "rand_chacha",
+ "serde",
+ "stringzilla",
+ "tabled",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -831,27 +852,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "testhashers"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "blake3",
- "cityhash",
- "clap 4.5.48",
- "crc32fast",
- "csv",
- "fork_union",
- "gxhash",
- "murmur3",
- "rand",
- "rand_chacha",
- "serde",
- "stringzilla",
- "tabled",
- "xxhash-rust",
 ]
 
 [[package]]

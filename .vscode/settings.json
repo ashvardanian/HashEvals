@@ -1,7 +1,16 @@
 {
     "cSpell.words": [
+        "ahash",
+        "cityhash",
+        "foldhash",
+        "fxhash",
+        "gxhash",
         "hashevals",
+        "Karp",
         "ngram",
-        "ngrams"
+        "ngrams",
+        "seahash",
+        "stringzilla",
+        "Zilla"
     ]
 }

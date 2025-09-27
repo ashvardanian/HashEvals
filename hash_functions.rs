@@ -154,7 +154,7 @@ impl HashFunction for CityHashFunction {
     }
 }
 
-/// Blake3 function (first 64 bits)
+/// Blake3 function (XOR-folded from 256 bits to 64 bits)
 pub struct Blake3Function;
 
 impl HashFunction for Blake3Function {
@@ -167,9 +167,22 @@ impl HashFunction for Blake3Function {
     fn hash(&self, data: &[u8]) -> u64 {
         let hash = blake3::hash(data);
         let bytes = hash.as_bytes();
-        u64::from_le_bytes([
+
+        // XOR-fold 256 bits into 64 bits by XORing four 64-bit chunks
+        let chunk1 = u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ])
+        ]);
+        let chunk2 = u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        let chunk3 = u64::from_le_bytes([
+            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+        ]);
+        let chunk4 = u64::from_le_bytes([
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+        ]);
+
+        chunk1 ^ chunk2 ^ chunk3 ^ chunk4
     }
 }
 

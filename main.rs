@@ -57,10 +57,7 @@ use tabled::{
     Table, Tabled,
 };
 
-use hash_functions::{
-    get_all_hash_functions_with_seed, get_available_hash_names,
-    get_hash_functions_by_names_with_seed, HashFunction,
-};
+use hash_functions::{create_all_hash_functions, HashFunction};
 
 fn format_thousands(n: usize) -> String {
     let s = n.to_string();
@@ -978,8 +975,9 @@ fn main() {
 
     if args.list_hashes {
         println!("Available hash functions:");
-        for name in get_available_hash_names() {
-            println!("  {}", name);
+        let all_functions = create_all_hash_functions(42);
+        for hash_func in &all_functions {
+            println!("  {}", hash_func.name());
         }
         return;
     }
@@ -997,13 +995,25 @@ fn main() {
 
     // Select hash functions to test
     let hash_functions = if args.hash_functions.is_empty() {
-        get_all_hash_functions_with_seed(args.seed)
+        create_all_hash_functions(args.seed)
     } else {
-        let selected = get_hash_functions_by_names_with_seed(&args.hash_functions, args.seed);
+        let all_functions = create_all_hash_functions(args.seed);
+        let names_lower: Vec<String> = args
+            .hash_functions
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+
+        let selected: Vec<Box<dyn HashFunction>> = all_functions
+            .into_iter()
+            .filter(|f| names_lower.contains(&f.name().to_lowercase()))
+            .collect();
+
         if selected.is_empty() {
             eprintln!("Error: No valid hash functions found. Available functions:");
-            for name in get_available_hash_names() {
-                eprintln!("  {}", name);
+            let all_functions = create_all_hash_functions(42);
+            for hash_func in &all_functions {
+                eprintln!("  {}", hash_func.name());
             }
             std::process::exit(1);
         }

@@ -402,7 +402,7 @@ impl HashFunction for RabinKarp32Function {
 }
 
 /// Central hash function registry - single source of truth
-fn create_all_hash_functions(seed: u64) -> Vec<Box<dyn HashFunction>> {
+pub fn create_all_hash_functions(seed: u64) -> Vec<Box<dyn HashFunction>> {
     vec![
         Box::new(StringZillaHash::with_seed(seed)),
         Box::new(SipHashFunction::with_seed(seed)),
@@ -418,42 +418,4 @@ fn create_all_hash_functions(seed: u64) -> Vec<Box<dyn HashFunction>> {
         Box::new(SeaHashFunction::with_seed(seed)),
         Box::new(RabinKarp32Function::with_seed(seed)),
     ]
-}
-
-/// Get all available hash functions with default seed
-pub fn get_all_hash_functions() -> Vec<Box<dyn HashFunction>> {
-    create_all_hash_functions(42)
-}
-
-/// Get all available hash functions with a specific seed for seeded functions
-pub fn get_all_hash_functions_with_seed(seed: u64) -> Vec<Box<dyn HashFunction>> {
-    create_all_hash_functions(seed)
-}
-
-/// Get hash functions by name (case-insensitive) with default seed
-pub fn get_hash_functions_by_names(names: &[String]) -> Vec<Box<dyn HashFunction>> {
-    get_hash_functions_by_names_with_seed(names, 42)
-}
-
-/// Get hash functions by name (case-insensitive) with a specific seed for seeded functions
-pub fn get_hash_functions_by_names_with_seed(
-    names: &[String],
-    seed: u64,
-) -> Vec<Box<dyn HashFunction>> {
-    let all_functions = create_all_hash_functions(seed);
-    let names_lower: Vec<String> = names.iter().map(|s| s.to_lowercase()).collect();
-
-    all_functions
-        .into_iter()
-        .filter(|f| names_lower.contains(&f.name().to_lowercase()))
-        .collect()
-}
-
-/// Get available hash function names
-pub fn get_available_hash_names() -> Vec<&'static str> {
-    // Use a temporary instance with default seed to get names
-    create_all_hash_functions(42)
-        .iter()
-        .map(|f| f.name())
-        .collect()
 }

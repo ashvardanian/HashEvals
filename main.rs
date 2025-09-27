@@ -132,11 +132,19 @@ fn find_bias_leaders(results: &[&DetailedTestResult]) -> String {
         .unwrap();
 
     // Find all results that have the best bias (ties)
-    let leaders: Vec<String> = results
+    let mut leaders: Vec<String> = results
         .iter()
         .filter(|r| (r.avalanche_bias - best_bias).abs() < 1e-10) // Handle floating point precision
         .map(|r| r.hash_name.clone())
         .collect();
+
+    // Limit display to avoid overly long cells
+    const MAX_LEADERS_DISPLAYED: usize = 3;
+    if leaders.len() > MAX_LEADERS_DISPLAYED {
+        let remaining_count = leaders.len() - MAX_LEADERS_DISPLAYED;
+        leaders.truncate(MAX_LEADERS_DISPLAYED);
+        leaders.push(format!("+ {} others", remaining_count));
+    }
 
     leaders.join(", ")
 }
@@ -150,11 +158,19 @@ fn find_speed_leaders(results: &[&DetailedTestResult]) -> String {
     let best_duration = results.iter().map(|r| r.duration_us).min().unwrap();
 
     // Find all results that have the best duration (ties)
-    let leaders: Vec<String> = results
+    let mut leaders: Vec<String> = results
         .iter()
         .filter(|r| r.duration_us == best_duration)
         .map(|r| r.hash_name.clone())
         .collect();
+
+    // Limit display to avoid overly long cells
+    const MAX_LEADERS_DISPLAYED: usize = 3;
+    if leaders.len() > MAX_LEADERS_DISPLAYED {
+        let remaining_count = leaders.len() - MAX_LEADERS_DISPLAYED;
+        leaders.truncate(MAX_LEADERS_DISPLAYED);
+        leaders.push(format!("+ {} others", remaining_count));
+    }
 
     leaders.join(", ")
 }
@@ -167,16 +183,24 @@ fn find_collision_leaders(results: &[&DetailedTestResult]) -> String {
     // Find the best (lowest) collision count
     let best_collisions = results
         .iter()
-        .map(|r| r.total_collisions_count)
+        .map(|r| r.total_collisions)
         .min()
         .unwrap();
 
     // Find all results that have the best collision count (ties)
-    let leaders: Vec<String> = results
+    let mut leaders: Vec<String> = results
         .iter()
-        .filter(|r| r.total_collisions_count == best_collisions)
+        .filter(|r| r.total_collisions == best_collisions)
         .map(|r| r.hash_name.clone())
         .collect();
+
+    // Limit display to avoid overly long cells
+    const MAX_LEADERS_DISPLAYED: usize = 3;
+    if leaders.len() > MAX_LEADERS_DISPLAYED {
+        let remaining_count = leaders.len() - MAX_LEADERS_DISPLAYED;
+        leaders.truncate(MAX_LEADERS_DISPLAYED);
+        leaders.push(format!("+ {} others", remaining_count));
+    }
 
     leaders.join(", ")
 }

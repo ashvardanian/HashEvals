@@ -58,7 +58,8 @@ use tabled::{
 };
 
 use hash_functions::{
-    get_all_hash_functions, get_available_hash_names, get_hash_functions_by_names, HashFunction,
+    get_all_hash_functions_with_seed, get_available_hash_names,
+    get_hash_functions_by_names_with_seed, HashFunction,
 };
 
 fn format_thousands(n: usize) -> String {
@@ -75,27 +76,32 @@ fn format_thousands(n: usize) -> String {
 
 fn format_duration(duration_us: u64) -> String {
     if duration_us < 1000 {
-        format!("{}μs", format_thousands(duration_us as usize))
+        format!("{} μs", format_thousands(duration_us as usize))
     } else if duration_us < 1_000_000 {
-        format!("{:.1}ms", duration_us as f64 / 1000.0)
+        format!("{:.1} ms", duration_us as f64 / 1000.0)
     } else if duration_us < 60_000_000 {
-        format!("{:.1}s", duration_us as f64 / 1_000_000.0)
+        format!("{:.1} s", duration_us as f64 / 1_000_000.0)
     } else {
         let total_seconds = duration_us / 1_000_000;
         let minutes = total_seconds / 60;
         let seconds = total_seconds % 60;
-        format!("{}m {}s", format_thousands(minutes as usize), seconds)
+        format!("{} m {} s", format_thousands(minutes as usize), seconds)
     }
 }
 
 /// Benchmark hash function performance separately from quality tests
-fn benchmark_hash_function<F>(hash_function: F, ngram_size: usize, num_iterations: usize) -> u64
+fn benchmark_hash_function<F>(
+    hash_function: F,
+    ngram_size: usize,
+    num_iterations: usize,
+    seed: u64,
+) -> u64
 where
     F: Fn(&[u8]) -> u64,
 {
     // Create a large random buffer for slicing
     let buffer_size = ngram_size * num_iterations + 1000; // Extra space to avoid bounds issues
-    let benchmark_buffer = generate_test_buffer(buffer_size, 12345);
+    let benchmark_buffer = generate_test_buffer(buffer_size, seed);
 
     // Warmup run - hash over the buffer once to warm caches and stabilize
     for i in 0..num_iterations {
@@ -258,6 +264,7 @@ pub fn test_avalanche<H, F>(
     hash_function: F,
     ngram_size: usize,
     num_samples: usize,
+    seed: u64,
 ) -> AvalancheResults
 where
     H: HashValue + Send + Sync,
@@ -265,7 +272,7 @@ where
 {
     // Generate test data buffer once
     let test_buffer_size = ngram_size + num_samples;
-    let test_buffer = generate_test_buffer(test_buffer_size, 42);
+    let test_buffer = generate_test_buffer(test_buffer_size, seed);
     let num_output_bits = H::total_bits() as usize;
     let num_input_bits_per_ngram = ngram_size * 8;
 
@@ -380,6 +387,7 @@ pub fn test_integral_collisions<F>(
     hash_function: F,
     ngram_size: usize,
     num_samples: usize,
+    seed: u64,
 ) -> Option<CollisionResults>
 where
     F: Fn(&[u8]) -> u64 + Send + Sync,
@@ -393,7 +401,7 @@ where
     let expected_collision_at = ((num_samples as f64).sqrt() * 1.2533) as usize; // √(π/2) * √n
 
     // Generate random u64 values with only lower N bytes populated
-    let mut rng = ChaCha20Rng::seed_from_u64(123456);
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
     let test_inputs: Vec<u64> = (0..num_samples)
         .map(|_| {
             let val = rng.random::<u64>();
@@ -467,6 +475,7 @@ pub fn test_buckets_distribution<H, F>(
     ngram_size: usize,
     num_samples: usize,
     num_buckets: usize,
+    seed: u64,
 ) -> DistributionResults
 where
     H: HashValue + Send + Sync,
@@ -474,7 +483,7 @@ where
 {
     // Generate test data buffer once
     let test_buffer_size = ngram_size + num_samples;
-    let test_buffer = generate_test_buffer(test_buffer_size, 789);
+    let test_buffer = generate_test_buffer(test_buffer_size, seed);
 
     // Pre-allocate thread-local bucket counters to avoid contention
     let num_worker_threads = thread_pool.threads();
@@ -625,8 +634,8 @@ fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult>
 
         aggregated.push(TestResult {
             hash_name,
-            avg_bias_display: format!("{:.5}%", avg_bias),
-            worst_bias_display: format!("{:.5}%", worst_bias),
+            avg_bias_display: format!("{:.5} %", avg_bias),
+            worst_bias_display: format!("{:.5} %", worst_bias),
             total_collisions_display: format_thousands(total_collisions_sum),
             avg_chi_square_display: format!("{:.3}", avg_chi_square),
             duration_display: format_duration(total_duration_us),
@@ -662,6 +671,7 @@ fn test_hash_functions_tabular(
     samples_per_size: usize,
     verbose: bool,
     csv_output: Option<&str>,
+    seed: u64,
 ) {
     // Collect detailed results for all hash functions and n-gram sizes
     let mut detailed_results = Vec::new();
@@ -704,12 +714,14 @@ fn test_hash_functions_tabular(
                         |d| hash_func.hash(d),
                         *ngram_size,
                         effective_samples,
+                        seed,
                     );
                     let collisions_opt = test_integral_collisions(
                         &mut pool,
                         |d| hash_func.hash(d),
                         *ngram_size,
                         effective_samples,
+                        seed,
                     );
                     let dist = test_buckets_distribution(
                         &mut pool,
@@ -717,6 +729,7 @@ fn test_hash_functions_tabular(
                         *ngram_size,
                         effective_samples * 10,
                         1024,
+                        seed,
                     );
                     let samples = effective_samples.min(dist.bucket_count * 10); // Actual samples tested
                     (aval, collisions_opt, dist, samples)
@@ -726,12 +739,14 @@ fn test_hash_functions_tabular(
                         |d| hash_func.hash(d) as u32,
                         *ngram_size,
                         effective_samples,
+                        seed,
                     );
                     let collisions_opt = test_integral_collisions(
                         &mut pool,
                         |d| hash_func.hash(d),
                         *ngram_size,
                         effective_samples,
+                        seed,
                     );
                     let dist = test_buckets_distribution(
                         &mut pool,
@@ -739,6 +754,7 @@ fn test_hash_functions_tabular(
                         *ngram_size,
                         effective_samples * 10,
                         1024,
+                        seed,
                     );
                     let samples = effective_samples.min(dist.bucket_count * 10);
                     (aval, collisions_opt, dist, samples)
@@ -762,11 +778,11 @@ fn test_hash_functions_tabular(
 
                 println!(" done");
                 println!(
-                    "    └─ Avalanche: avg={:.3}%, worst_bias={:.5}%, variance={:.3}",
+                    "    └─ Avalanche: avg={:.3} %, worst_bias={:.5} %, variance={:.3}",
                     avalanche.average_avalanche, avalanche.worst_bias, avalanche.variance
                 );
                 println!(
-                    "    └─ Best bit {}: {:.3}%, Worst bit {}: {:.3}%",
+                    "    └─ Best bit {}: {:.3} %, Worst bit {}: {:.3} %",
                     best_bit.0, best_bit.1, worst_bit.0, worst_bit.1
                 );
                 println!("    └─ Distribution: Chi²={:.3}", distribution.chi_square);
@@ -821,13 +837,14 @@ fn test_hash_functions_tabular(
                 |d| hash_func.hash(d),
                 *ngram_size,
                 10000, // Number of hash operations for stable timing
+                seed,
             );
 
             detailed_results.push(DetailedTestResult {
                 hash_name: hash_func.name().to_string(),
                 ngram_size: *ngram_size,
                 ngrams_tested: actual_samples,
-                avalanche_bias_display: format!("{:.5}%", avalanche.worst_bias),
+                avalanche_bias_display: format!("{:.5} %", avalanche.worst_bias),
                 total_collisions,
                 first_collision_display: collision_display,
                 distribution_score_display: format!("{:.3}", distribution.chi_square),
@@ -871,10 +888,10 @@ fn test_hash_functions_tabular(
         ngram_size: usize,
         #[tabled(rename = "Lowest Bias")]
         lowest_bias_leaders: String,
-        #[tabled(rename = "Highest Speed")]
-        highest_speed_leaders: String,
         #[tabled(rename = "Lowest Collisions")]
         lowest_collisions_leaders: String,
+        #[tabled(rename = "Highest Speed")]
+        highest_speed_leaders: String,
     }
 
     let mut ngram_summaries = Vec::new();
@@ -889,8 +906,8 @@ fn test_hash_functions_tabular(
             ngram_summaries.push(NGramSummary {
                 ngram_size: *ngram_size,
                 lowest_bias_leaders: find_bias_leaders(&size_results),
-                highest_speed_leaders: find_speed_leaders(&size_results),
                 lowest_collisions_leaders: find_collision_leaders(&size_results),
+                highest_speed_leaders: find_speed_leaders(&size_results),
             });
         }
     }
@@ -901,7 +918,7 @@ fn test_hash_functions_tabular(
     let summary_table = Table::new(&ngram_summaries)
         .with(Style::psql())
         .modify(
-            tabled::settings::object::Columns::new(2..5),
+            tabled::settings::object::Columns::new(1..4),
             Alignment::right(),
         )
         .to_string();
@@ -940,6 +957,10 @@ struct Args {
     /// Export results to CSV file
     #[arg(long = "csv", value_name = "FILE")]
     csv_output: Option<String>,
+
+    /// Seed for reproducible results (affects both PRNGs and seeded hash functions)
+    #[arg(long = "seed", default_value = "42")]
+    seed: u64,
 }
 
 fn parse_ngram_sizes(s: &str) -> Result<Vec<usize>, String> {
@@ -976,9 +997,9 @@ fn main() {
 
     // Select hash functions to test
     let hash_functions = if args.hash_functions.is_empty() {
-        get_all_hash_functions()
+        get_all_hash_functions_with_seed(args.seed)
     } else {
-        let selected = get_hash_functions_by_names(&args.hash_functions);
+        let selected = get_hash_functions_by_names_with_seed(&args.hash_functions, args.seed);
         if selected.is_empty() {
             eprintln!("Error: No valid hash functions found. Available functions:");
             for name in get_available_hash_names() {
@@ -1018,6 +1039,7 @@ fn main() {
         args.samples,
         args.verbose,
         args.csv_output.as_deref(),
+        args.seed,
     );
 
     println!();

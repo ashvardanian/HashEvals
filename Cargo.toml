@@ -27,10 +27,11 @@ gxhash = "3.5"
 crc32fast = "1.5"
 blake3 = "1.8"
 murmur3 = "0.5"
-cityhash = "0.1"
-fxhash = "0.2"
+farmhash = "1.1.5"
+rustc-hash = "2"
 foldhash = "0.2"
-seahash = "4.1"
+seahash = "4"
+siphasher = "1"
 
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive"] }

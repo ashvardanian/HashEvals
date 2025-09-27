@@ -1,10 +1,10 @@
 use ahash::RandomState as AHashState;
-use fxhash::FxBuildHasher;
-use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
+use rustc_hash::FxHasher;
+use siphasher::sip::SipHasher13;
+use std::hash::{BuildHasher, Hasher};
 use std::io::Cursor;
 use stringzilla::sz;
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 /// Trait for hash functions that can be tested
 pub trait HashFunction: Send + Sync {
@@ -14,7 +14,15 @@ pub trait HashFunction: Send + Sync {
 }
 
 /// StringZilla hash function
-pub struct StringZillaHash;
+pub struct StringZillaHash {
+    seed: u64,
+}
+
+impl StringZillaHash {
+    pub fn with_seed(seed: u64) -> Self {
+        Self { seed }
+    }
+}
 
 impl HashFunction for StringZillaHash {
     fn name(&self) -> &'static str {
@@ -24,20 +32,22 @@ impl HashFunction for StringZillaHash {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        sz::hash(data)
+        sz::hash_with_seed(data, self.seed)
     }
 }
 
-/// SipHash (standard library default)
+/// SipHash using siphasher crate for proper seeding
 pub struct SipHashFunction {
-    builder: RandomState,
+    key: [u8; 16],
 }
 
 impl SipHashFunction {
-    pub fn new() -> Self {
-        Self {
-            builder: RandomState::new(),
-        }
+    pub fn with_seed(seed: u64) -> Self {
+        // Derive a 16-byte key from the 64-bit seed
+        let mut key = [0u8; 16];
+        key[0..8].copy_from_slice(&seed.to_le_bytes());
+        key[8..16].copy_from_slice(&seed.wrapping_add(0x9e3779b97f4a7c15).to_le_bytes());
+        Self { key }
     }
 }
 
@@ -49,7 +59,9 @@ impl HashFunction for SipHashFunction {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        self.builder.hash_one(data)
+        let mut hasher = SipHasher13::new_with_key(&self.key);
+        hasher.write(data);
+        hasher.finish()
     }
 }
 
@@ -59,9 +71,9 @@ pub struct AHashFunction {
 }
 
 impl AHashFunction {
-    pub fn new() -> Self {
+    pub fn with_seed(seed: u64) -> Self {
         Self {
-            builder: AHashState::with_seed(42),
+            builder: AHashState::with_seed(seed as usize),
         }
     }
 }
@@ -79,7 +91,15 @@ impl HashFunction for AHashFunction {
 }
 
 /// xxHash3 function
-pub struct XXHash3Function;
+pub struct XXHash3Function {
+    seed: u64,
+}
+
+impl XXHash3Function {
+    pub fn with_seed(seed: u64) -> Self {
+        Self { seed }
+    }
+}
 
 impl HashFunction for XXHash3Function {
     fn name(&self) -> &'static str {
@@ -89,12 +109,20 @@ impl HashFunction for XXHash3Function {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        xxh3_64(data)
+        xxh3_64_with_seed(data, self.seed)
     }
 }
 
 /// gxHash function
-pub struct GxHashFunction;
+pub struct GxHashFunction {
+    seed: u64,
+}
+
+impl GxHashFunction {
+    pub fn with_seed(seed: u64) -> Self {
+        Self { seed }
+    }
+}
 
 impl HashFunction for GxHashFunction {
     fn name(&self) -> &'static str {
@@ -104,12 +132,22 @@ impl HashFunction for GxHashFunction {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        gxhash::gxhash64(data, 42)
+        gxhash::gxhash64(data, self.seed as i64)
     }
 }
 
-/// CRC32 function
-pub struct Crc32Function;
+/// CRC32 function with seeding support
+pub struct Crc32Function {
+    initial: u32,
+}
+
+impl Crc32Function {
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            initial: seed as u32,
+        }
+    }
+}
 
 impl HashFunction for Crc32Function {
     fn name(&self) -> &'static str {
@@ -119,12 +157,22 @@ impl HashFunction for Crc32Function {
         32
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        crc32fast::hash(data) as u64
+        let mut hasher = crc32fast::Hasher::new_with_initial(self.initial);
+        hasher.update(data);
+        hasher.finalize() as u64
     }
 }
 
 /// Murmur3 function
-pub struct Murmur3Function;
+pub struct Murmur3Function {
+    seed: u32,
+}
+
+impl Murmur3Function {
+    pub fn with_seed(seed: u64) -> Self {
+        Self { seed: seed as u32 }
+    }
+}
 
 impl HashFunction for Murmur3Function {
     fn name(&self) -> &'static str {
@@ -135,27 +183,96 @@ impl HashFunction for Murmur3Function {
     }
     fn hash(&self, data: &[u8]) -> u64 {
         let mut cursor = Cursor::new(data);
-        murmur3::murmur3_x64_128(&mut cursor, 0).unwrap() as u64
+        murmur3::murmur3_x64_128(&mut cursor, self.seed).unwrap() as u64
     }
 }
 
-/// CityHash function
-pub struct CityHashFunction;
+/// FarmHash function with seeding support
+pub struct FarmHashFunction {
+    seed: u64,
+}
 
-impl HashFunction for CityHashFunction {
+impl FarmHashFunction {
+    pub fn with_seed(seed: u64) -> Self {
+        Self { seed }
+    }
+}
+
+impl HashFunction for FarmHashFunction {
     fn name(&self) -> &'static str {
-        "CityHash"
+        "FarmHash"
     }
     fn bits(&self) -> u32 {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        cityhash::city_hash_64(data)
+        farmhash::hash64_with_seed(data, self.seed)
     }
 }
 
-/// Blake3 function (XOR-folded from 256 bits to 64 bits)
-pub struct Blake3Function;
+/// Blake3 function (XOR-folded from 256 bits to 64 bits) with keyed hashing support
+pub struct Blake3Function {
+    key: [u8; 32],
+}
+
+impl Blake3Function {
+    pub fn with_seed(seed: u64) -> Self {
+        // Derive a 32-byte key from the 64-bit seed
+        let mut key = [0u8; 32];
+        for i in 0..4 {
+            let offset = i * 8;
+            let derived_seed = seed.wrapping_add((i as u64) * 0x9e3779b97f4a7c15);
+            key[offset..offset + 8].copy_from_slice(&derived_seed.to_le_bytes());
+        }
+        Self { key }
+    }
+
+    fn fold_hash_to_u64(hash_bytes: &[u8; 32]) -> u64 {
+        // XOR-fold 256 bits into 64 bits by XORing four 64-bit chunks
+        let chunk1 = u64::from_le_bytes([
+            hash_bytes[0],
+            hash_bytes[1],
+            hash_bytes[2],
+            hash_bytes[3],
+            hash_bytes[4],
+            hash_bytes[5],
+            hash_bytes[6],
+            hash_bytes[7],
+        ]);
+        let chunk2 = u64::from_le_bytes([
+            hash_bytes[8],
+            hash_bytes[9],
+            hash_bytes[10],
+            hash_bytes[11],
+            hash_bytes[12],
+            hash_bytes[13],
+            hash_bytes[14],
+            hash_bytes[15],
+        ]);
+        let chunk3 = u64::from_le_bytes([
+            hash_bytes[16],
+            hash_bytes[17],
+            hash_bytes[18],
+            hash_bytes[19],
+            hash_bytes[20],
+            hash_bytes[21],
+            hash_bytes[22],
+            hash_bytes[23],
+        ]);
+        let chunk4 = u64::from_le_bytes([
+            hash_bytes[24],
+            hash_bytes[25],
+            hash_bytes[26],
+            hash_bytes[27],
+            hash_bytes[28],
+            hash_bytes[29],
+            hash_bytes[30],
+            hash_bytes[31],
+        ]);
+
+        chunk1 ^ chunk2 ^ chunk3 ^ chunk4
+    }
+}
 
 impl HashFunction for Blake3Function {
     fn name(&self) -> &'static str {
@@ -165,36 +282,21 @@ impl HashFunction for Blake3Function {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        let hash = blake3::hash(data);
+        let hash = blake3::keyed_hash(&self.key, data);
         let bytes = hash.as_bytes();
-
-        // XOR-fold 256 bits into 64 bits by XORing four 64-bit chunks
-        let chunk1 = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-        let chunk2 = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ]);
-        let chunk3 = u64::from_le_bytes([
-            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
-        ]);
-        let chunk4 = u64::from_le_bytes([
-            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
-        ]);
-
-        chunk1 ^ chunk2 ^ chunk3 ^ chunk4
+        Self::fold_hash_to_u64(bytes)
     }
 }
 
-/// FxHash function
+/// FxHash function with seeding support
 pub struct FxHashFunction {
-    builder: FxBuildHasher,
+    seed: usize,
 }
 
 impl FxHashFunction {
-    pub fn new() -> Self {
+    pub fn with_seed(seed: u64) -> Self {
         Self {
-            builder: FxBuildHasher::default(),
+            seed: seed as usize,
         }
     }
 }
@@ -207,19 +309,21 @@ impl HashFunction for FxHashFunction {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        self.builder.hash_one(data)
+        let mut hasher = FxHasher::with_seed(self.seed);
+        hasher.write(data);
+        hasher.finish()
     }
 }
 
 /// FoldHash function
 pub struct FoldHashFunction {
-    builder: foldhash::fast::RandomState,
+    builder: foldhash::fast::FixedState,
 }
 
 impl FoldHashFunction {
-    pub fn new() -> Self {
+    pub fn with_seed(seed: u64) -> Self {
         Self {
-            builder: foldhash::fast::RandomState::default(),
+            builder: foldhash::fast::FixedState::with_seed(seed),
         }
     }
 }
@@ -237,7 +341,15 @@ impl HashFunction for FoldHashFunction {
 }
 
 /// SeaHash function
-pub struct SeaHashFunction;
+pub struct SeaHashFunction {
+    seed: u64,
+}
+
+impl SeaHashFunction {
+    pub fn with_seed(seed: u64) -> Self {
+        Self { seed }
+    }
+}
 
 impl HashFunction for SeaHashFunction {
     fn name(&self) -> &'static str {
@@ -247,21 +359,31 @@ impl HashFunction for SeaHashFunction {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        seahash::hash(data)
+        seahash::hash_seeded(data, self.seed, self.seed, self.seed, self.seed)
     }
 }
 
-/// Classical 32-bit Karp-Rabin rolling hash (base 256 modulo prime)
-pub struct RabinKarp32Function;
+/// Classical 32-bit Karp-Rabin rolling hash with seeded additive factor
+pub struct RabinKarp32Function {
+    additive_factor: u64,
+}
 
 impl RabinKarp32Function {
     const BASE: u64 = 256;
     const MODULUS: u64 = 1_000_000_007; // large prime commonly used for Rabin-Karp
 
-    fn compute(data: &[u8]) -> u32 {
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            additive_factor: seed,
+        }
+    }
+
+    fn compute(&self, data: &[u8]) -> u32 {
         let mut acc = 0u64;
         for &byte in data {
-            acc = (acc * Self::BASE + byte as u64) % Self::MODULUS;
+            // Add the seed as an additive factor to each byte value
+            let seeded_byte = byte as u64 + self.additive_factor;
+            acc = (acc * Self::BASE + seeded_byte) % Self::MODULUS;
         }
         acc as u32
     }
@@ -275,32 +397,50 @@ impl HashFunction for RabinKarp32Function {
         32
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        Self::compute(data) as u64
+        self.compute(data) as u64
     }
 }
 
-/// Get all available hash functions
-pub fn get_all_hash_functions() -> Vec<Box<dyn HashFunction>> {
+/// Central hash function registry - single source of truth
+fn create_all_hash_functions(seed: u64) -> Vec<Box<dyn HashFunction>> {
     vec![
-        Box::new(StringZillaHash),
-        Box::new(SipHashFunction::new()),
-        Box::new(AHashFunction::new()),
-        Box::new(XXHash3Function),
-        Box::new(GxHashFunction),
-        Box::new(Crc32Function),
-        Box::new(Murmur3Function),
-        Box::new(CityHashFunction),
-        Box::new(Blake3Function),
-        Box::new(FxHashFunction::new()),
-        Box::new(FoldHashFunction::new()),
-        Box::new(SeaHashFunction),
-        Box::new(RabinKarp32Function),
+        Box::new(StringZillaHash::with_seed(seed)),
+        Box::new(SipHashFunction::with_seed(seed)),
+        Box::new(AHashFunction::with_seed(seed)),
+        Box::new(XXHash3Function::with_seed(seed)),
+        Box::new(GxHashFunction::with_seed(seed)),
+        Box::new(Crc32Function::with_seed(seed)),
+        Box::new(Murmur3Function::with_seed(seed)),
+        Box::new(FarmHashFunction::with_seed(seed)),
+        Box::new(Blake3Function::with_seed(seed)),
+        Box::new(FxHashFunction::with_seed(seed)),
+        Box::new(FoldHashFunction::with_seed(seed)),
+        Box::new(SeaHashFunction::with_seed(seed)),
+        Box::new(RabinKarp32Function::with_seed(seed)),
     ]
 }
 
-/// Get hash functions by name (case-insensitive)
+/// Get all available hash functions with default seed
+pub fn get_all_hash_functions() -> Vec<Box<dyn HashFunction>> {
+    create_all_hash_functions(42)
+}
+
+/// Get all available hash functions with a specific seed for seeded functions
+pub fn get_all_hash_functions_with_seed(seed: u64) -> Vec<Box<dyn HashFunction>> {
+    create_all_hash_functions(seed)
+}
+
+/// Get hash functions by name (case-insensitive) with default seed
 pub fn get_hash_functions_by_names(names: &[String]) -> Vec<Box<dyn HashFunction>> {
-    let all_functions = get_all_hash_functions();
+    get_hash_functions_by_names_with_seed(names, 42)
+}
+
+/// Get hash functions by name (case-insensitive) with a specific seed for seeded functions
+pub fn get_hash_functions_by_names_with_seed(
+    names: &[String],
+    seed: u64,
+) -> Vec<Box<dyn HashFunction>> {
+    let all_functions = create_all_hash_functions(seed);
     let names_lower: Vec<String> = names.iter().map(|s| s.to_lowercase()).collect();
 
     all_functions
@@ -311,5 +451,9 @@ pub fn get_hash_functions_by_names(names: &[String]) -> Vec<Box<dyn HashFunction
 
 /// Get available hash function names
 pub fn get_available_hash_names() -> Vec<&'static str> {
-    get_all_hash_functions().iter().map(|f| f.name()).collect()
+    // Use a temporary instance with default seed to get names
+    create_all_hash_functions(42)
+        .iter()
+        .map(|f| f.name())
+        .collect()
 }

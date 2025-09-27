@@ -857,7 +857,7 @@ fn test_hash_functions_tabular(
             let duration_us = benchmark_hash_function(
                 |d| hash_func.hash(d),
                 *ngram_size,
-                10000, // Number of hash operations for stable timing
+                actual_samples,
                 seed,
             );
 

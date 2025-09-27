@@ -18,10 +18,10 @@ by systematically testing how input bit patterns affect output distribution.
 
 ```sh
 # Make sure everything compiles and logs are shown
-RUSTFLAGS="-C target-cpu=native" cargo run --release --samples 100 --verbose
+RUSTFLAGS="-C target-cpu=native" cargo run --release -- --samples 100 --verbose
 
 # Stress-test all hash functions, outputting also to file... will take a while
-time RUSTFLAGS="-C target-cpu=native" cargo run --release 2>&1 | tee results.txt
+time RUSTFLAGS="-C target-cpu=native" cargo run --release -- --samples 100000
 
 # Test specific hash functions
 RUSTFLAGS="-C target-cpu=native" cargo run --release -- --hash gxhash --hash xxhash3
@@ -71,47 +71,31 @@ fn format_thousands(n: usize) -> String {
     result.chars().rev().collect()
 }
 
-fn format_duration(duration_us: u64) -> String {
-    if duration_us < 1000 {
-        format!("{} μs", format_thousands(duration_us as usize))
-    } else if duration_us < 1_000_000 {
-        format!("{:.1} ms", duration_us as f64 / 1000.0)
-    } else if duration_us < 60_000_000 {
-        format!("{:.1} s", duration_us as f64 / 1_000_000.0)
-    } else {
-        let total_seconds = duration_us / 1_000_000;
-        let minutes = total_seconds / 60;
-        let seconds = total_seconds % 60;
-        format!("{} m {} s", format_thousands(minutes as usize), seconds)
-    }
-}
-
 /// Benchmark hash function performance separately from quality tests
 fn benchmark_hash_function<F>(
     hash_function: F,
     ngram_size: usize,
-    num_iterations: usize,
+    num_samples: usize,
     seed: u64,
 ) -> u64
 where
     F: Fn(&[u8]) -> u64,
 {
     // Create a large random buffer for slicing
-    let buffer_size = ngram_size * num_iterations + 1000; // Extra space to avoid bounds issues
+    let buffer_size = num_samples + ngram_size - 1;
     let benchmark_buffer = generate_test_buffer(buffer_size, seed);
 
     // Warmup run - hash over the buffer once to warm caches and stabilize
-    for i in 0..num_iterations {
-        let start_idx = i % (buffer_size - ngram_size);
-        let slice = &benchmark_buffer[start_idx..start_idx + ngram_size];
+    let warmup_samples = 1000.min(num_samples);
+    for i in 0..warmup_samples {
+        let slice = &benchmark_buffer[i..i + ngram_size];
         std::hint::black_box(hash_function(slice));
     }
 
     // Single timed run - hash the same number of slices
     let start_time = std::time::Instant::now();
-    for i in 0..num_iterations {
-        let start_idx = i % (buffer_size - ngram_size);
-        let slice = &benchmark_buffer[start_idx..start_idx + ngram_size];
+    for i in 0..num_samples {
+        let slice = &benchmark_buffer[i..i + ngram_size];
         std::hint::black_box(hash_function(slice));
     }
     let duration = start_time.elapsed();
@@ -181,11 +165,7 @@ fn find_collision_leaders(results: &[&DetailedTestResult]) -> String {
     }
 
     // Find the best (lowest) collision count
-    let best_collisions = results
-        .iter()
-        .map(|r| r.total_collisions)
-        .min()
-        .unwrap();
+    let best_collisions = results.iter().map(|r| r.total_collisions).min().unwrap();
 
     // Find all results that have the best collision count (ties)
     let mut leaders: Vec<String> = results
@@ -584,9 +564,6 @@ struct DetailedTestResult {
     #[serde(skip)]
     #[tabled(skip)]
     distribution_score: f64,
-    #[serde(skip)]
-    #[tabled(skip)]
-    total_collisions_count: usize,
     #[serde(rename = "duration_us")]
     #[tabled(skip)]
     duration_us: u64,
@@ -605,8 +582,8 @@ struct TestResult {
     total_collisions_display: String,
     #[tabled(rename = "Chi²")]
     avg_chi_square_display: String,
-    #[tabled(rename = "Duration")]
-    duration_display: String,
+    #[tabled(rename = "Throughput")]
+    throughput_display: String,
     #[serde(rename = "total_collisions")]
     #[tabled(skip)]
     total_collisions: usize,
@@ -645,21 +622,40 @@ fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult>
             results.iter().map(|r| r.distribution_score).sum::<f64>() / results.len() as f64;
 
         // Sum total collisions across all n-gram sizes
-        let total_collisions_sum = results
-            .iter()
-            .map(|r| r.total_collisions_count)
-            .sum::<usize>();
+        let total_collisions_sum = results.iter().map(|r| r.total_collisions).sum::<usize>();
+
+        // Sum total samples across all n-gram sizes for collision percentage
+        let total_samples = results.iter().map(|r| r.ngrams_tested).sum::<usize>();
+
+        // Calculate collision percentage
+        let collision_percentage = if total_samples > 0 {
+            (total_collisions_sum as f64 / total_samples as f64) * 100.0
+        } else {
+            0.0
+        };
 
         // Sum total duration across all n-gram sizes
         let total_duration_us = results.iter().map(|r| r.duration_us).sum::<u64>();
+
+        // Calculate total bytes processed across all n-gram sizes
+        let total_bytes_processed: usize =
+            results.iter().map(|r| r.ngrams_tested * r.ngram_size).sum();
+
+        // Calculate aggregated throughput
+        let aggregated_throughput_mib_per_sec = if total_duration_us > 0 {
+            (total_bytes_processed as f64 / (1024.0 * 1024.0))
+                / (total_duration_us as f64 / 1_000_000.0)
+        } else {
+            0.0
+        };
 
         aggregated.push(TestResult {
             hash_name,
             avg_bias_display: format!("{:.5} %", avg_bias),
             worst_bias_display: format!("{:.5} %", worst_bias),
-            total_collisions_display: format_thousands(total_collisions_sum),
+            total_collisions_display: format!("{:.3} %", collision_percentage),
             avg_chi_square_display: format!("{:.3}", avg_chi_square),
-            duration_display: format_duration(total_duration_us),
+            throughput_display: format!("{:.1} MiB/s", aggregated_throughput_mib_per_sec),
             total_collisions: total_collisions_sum,
             duration_us: total_duration_us,
             avg_bias,
@@ -781,6 +777,19 @@ fn test_hash_functions_tabular(
                     (aval, collisions_opt, dist, samples)
                 };
 
+            // Benchmark hash function performance separately
+            let duration_us =
+                benchmark_hash_function(|d| hash_func.hash(d), *ngram_size, actual_samples, seed);
+
+            // Calculate throughput metrics
+            let total_bytes_processed = actual_samples * *ngram_size;
+            let throughput_mib_per_sec = if duration_us > 0 {
+                (total_bytes_processed as f64 / (1024.0 * 1024.0))
+                    / (duration_us as f64 / 1_000_000.0)
+            } else {
+                0.0
+            };
+
             // Show detailed stats immediately if verbose mode
             if verbose {
                 // Find best and worst performing bits
@@ -834,32 +843,25 @@ fn test_hash_functions_tabular(
                 } else {
                     println!("    └─ Integral ⨳: Skipped (N-gram size > 8)");
                 }
+                println!(
+                    "    └─ Performance: {} μs, {:.1} MiB/s ({} bytes)",
+                    duration_us,
+                    throughput_mib_per_sec,
+                    format_thousands(total_bytes_processed)
+                );
             } else {
                 println!(" done");
             }
 
-            let (total_collisions, collision_display, total_collisions_count) =
-                if let Some(collisions) = &collisions_opt {
-                    let display = match collisions.first_collision_at {
-                        Some(pos) => format!("@{}", format_thousands(pos)),
-                        None => "None".to_string(),
-                    };
-                    (
-                        collisions.total_collisions,
-                        display,
-                        collisions.total_collisions,
-                    )
-                } else {
-                    (0, "N/A".to_string(), 0)
+            let (total_collisions, collision_display) = if let Some(collisions) = &collisions_opt {
+                let display = match collisions.first_collision_at {
+                    Some(pos) => format!("@{}", format_thousands(pos)),
+                    None => "None".to_string(),
                 };
-
-            // Benchmark hash function performance separately
-            let duration_us = benchmark_hash_function(
-                |d| hash_func.hash(d),
-                *ngram_size,
-                actual_samples,
-                seed,
-            );
+                (collisions.total_collisions, display)
+            } else {
+                (0, "N/A".to_string())
+            };
 
             detailed_results.push(DetailedTestResult {
                 hash_name: hash_func.name().to_string(),
@@ -871,7 +873,6 @@ fn test_hash_functions_tabular(
                 distribution_score_display: format!("{:.3}", distribution.chi_square),
                 avalanche_bias: avalanche.worst_bias,
                 distribution_score: distribution.chi_square,
-                total_collisions_count,
                 duration_us,
             });
         }
@@ -1058,6 +1059,7 @@ fn main() {
         "  Samples per size: {} n-grams",
         format_thousands(args.samples)
     );
+    println!("  Random seed: {}", args.seed);
     let total_tests = ngram_sizes
         .iter()
         .map(|&s| s * 8 * args.samples)
@@ -1078,9 +1080,10 @@ fn main() {
 
     println!();
     println!("Notes:");
+    println!("- Aggregation across n-gram sizes: Avg.Bias (averaged), Worst.Bias (maximum), Integral ⨳ (summed), Chi² (averaged), Throughput (aggregated)");
     println!("- Avalanche bias: <0.1% (excellent), <0.5% (very good), <1.0% (good)");
     println!("- Chi²: Lower values indicate better distribution uniformity");
-    println!("- Integral ⨳: Collisions on random N-byte little-endian uints (only for N ≤ 8)");
-    println!("  Expected collision ~√(π/2) × √samples by birthday paradox");
+    println!("- Integral ⨳: Collision rate as percentage of total samples tested (only for N ≤ 8)");
+    println!("  Expected rate ~√(π/2) × √samples / samples by birthday paradox");
     println!("  Uses sample-sized bitset with hash % sample_size mapping");
 }

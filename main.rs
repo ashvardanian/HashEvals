@@ -73,17 +73,47 @@ fn format_thousands(n: usize) -> String {
     result.chars().rev().collect()
 }
 
-fn format_duration(duration_ms: u64) -> String {
-    if duration_ms < 1000 {
-        format!("{}ms", format_thousands(duration_ms as usize))
-    } else if duration_ms < 60_000 {
-        format!("{:.1}s", duration_ms as f64 / 1000.0)
+fn format_duration(duration_us: u64) -> String {
+    if duration_us < 1000 {
+        format!("{}μs", format_thousands(duration_us as usize))
+    } else if duration_us < 1_000_000 {
+        format!("{:.1}ms", duration_us as f64 / 1000.0)
+    } else if duration_us < 60_000_000 {
+        format!("{:.1}s", duration_us as f64 / 1_000_000.0)
     } else {
-        let total_seconds = duration_ms / 1000;
+        let total_seconds = duration_us / 1_000_000;
         let minutes = total_seconds / 60;
         let seconds = total_seconds % 60;
         format!("{}m {}s", format_thousands(minutes as usize), seconds)
     }
+}
+
+/// Benchmark hash function performance separately from quality tests
+fn benchmark_hash_function<F>(hash_function: F, ngram_size: usize, num_iterations: usize) -> u64
+where
+    F: Fn(&[u8]) -> u64,
+{
+    // Create a large random buffer for slicing
+    let buffer_size = ngram_size * num_iterations + 1000; // Extra space to avoid bounds issues
+    let benchmark_buffer = generate_test_buffer(buffer_size, 12345);
+
+    // Warmup run - hash over the buffer once to warm caches and stabilize
+    for i in 0..num_iterations {
+        let start_idx = i % (buffer_size - ngram_size);
+        let slice = &benchmark_buffer[start_idx..start_idx + ngram_size];
+        std::hint::black_box(hash_function(slice));
+    }
+
+    // Single timed run - hash the same number of slices
+    let start_time = std::time::Instant::now();
+    for i in 0..num_iterations {
+        let start_idx = i % (buffer_size - ngram_size);
+        let slice = &benchmark_buffer[start_idx..start_idx + ngram_size];
+        std::hint::black_box(hash_function(slice));
+    }
+    let duration = start_time.elapsed();
+
+    duration.as_micros() as u64
 }
 
 fn find_bias_leaders(results: &[&DetailedTestResult]) -> String {
@@ -114,12 +144,12 @@ fn find_speed_leaders(results: &[&DetailedTestResult]) -> String {
     }
 
     // Find the best (lowest) duration
-    let best_duration = results.iter().map(|r| r.duration_ms).min().unwrap();
+    let best_duration = results.iter().map(|r| r.duration_us).min().unwrap();
 
     // Find all results that have the best duration (ties)
     let leaders: Vec<String> = results
         .iter()
-        .filter(|r| r.duration_ms == best_duration)
+        .filter(|r| r.duration_us == best_duration)
         .map(|r| r.hash_name.clone())
         .collect();
 
@@ -527,9 +557,9 @@ struct DetailedTestResult {
     #[serde(skip)]
     #[tabled(skip)]
     total_collisions_count: usize,
-    #[serde(rename = "duration_ms")]
+    #[serde(rename = "duration_us")]
     #[tabled(skip)]
-    duration_ms: u64,
+    duration_us: u64,
 }
 
 /// Aggregated test result for main summary table and CSV export
@@ -550,9 +580,9 @@ struct TestResult {
     #[serde(rename = "total_collisions")]
     #[tabled(skip)]
     total_collisions: usize,
-    #[serde(rename = "duration_ms")]
+    #[serde(rename = "duration_us")]
     #[tabled(skip)]
-    duration_ms: u64,
+    duration_us: u64,
     #[serde(skip)]
     #[tabled(skip)]
     avg_bias: f64,
@@ -591,7 +621,7 @@ fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult>
             .sum::<usize>();
 
         // Sum total duration across all n-gram sizes
-        let total_duration_ms = results.iter().map(|r| r.duration_ms).sum::<u64>();
+        let total_duration_us = results.iter().map(|r| r.duration_us).sum::<u64>();
 
         aggregated.push(TestResult {
             hash_name,
@@ -599,9 +629,9 @@ fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult>
             worst_bias_display: format!("{:.5}%", worst_bias),
             total_collisions_display: format_thousands(total_collisions_sum),
             avg_chi_square_display: format!("{:.3}", avg_chi_square),
-            duration_display: format_duration(total_duration_ms),
+            duration_display: format_duration(total_duration_us),
             total_collisions: total_collisions_sum,
-            duration_ms: total_duration_ms,
+            duration_us: total_duration_us,
             avg_bias,
         });
     }
@@ -665,9 +695,6 @@ fn test_hash_functions_tabular(
 
         for hash_func in hash_functions {
             print!("  Testing {}...", hash_func.name());
-
-            // Start timing
-            let start_time = std::time::Instant::now();
 
             // Run tests based on bit width
             let (avalanche, collisions_opt, distribution, actual_samples) =
@@ -789,8 +816,12 @@ fn test_hash_functions_tabular(
                     (0, "N/A".to_string(), 0)
                 };
 
-            // Calculate test duration
-            let duration_ms = start_time.elapsed().as_millis() as u64;
+            // Benchmark hash function performance separately
+            let duration_us = benchmark_hash_function(
+                |d| hash_func.hash(d),
+                *ngram_size,
+                10000, // Number of hash operations for stable timing
+            );
 
             detailed_results.push(DetailedTestResult {
                 hash_name: hash_func.name().to_string(),
@@ -803,7 +834,7 @@ fn test_hash_functions_tabular(
                 avalanche_bias: avalanche.worst_bias,
                 distribution_score: distribution.chi_square,
                 total_collisions_count,
-                duration_ms,
+                duration_us,
             });
         }
     }

@@ -44,10 +44,15 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release -- --samples 50000 --ngrams
 
 mod hash_functions;
 
+use std::fs::File;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use clap::Parser;
 use fork_union as fu;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use serde::{Deserialize, Serialize};
+use tabled::{settings::{Style, Alignment}, Table, Tabled};
 
 use hash_functions::{
     get_all_hash_functions, get_available_hash_names, get_hash_functions_by_names, HashFunction,
@@ -123,14 +128,15 @@ pub struct AvalancheResults {
     pub total_tests: usize,       // Number of bit-flip tests performed
 }
 
-/// Results of differential key analysis
+/// Results of u32 collision analysis
 #[derive(Debug)]
-pub struct DifferentialResults {
-    pub expected_collisions: f64,
-    pub actual_collisions: usize,
-    pub collision_ratio: f64,
-    pub worst_pattern: Option<Vec<usize>>, // Bit positions of worst differential
+pub struct CollisionResults {
+    pub total_collisions: usize,
+    pub first_collision_at: Option<usize>,
+    pub collision_value: Option<u32>,
+    pub expected_collision_at: usize, // Birthday paradox expectation
     pub total_tests: usize,
+    pub collision_rate: f64, // Actual collision rate
 }
 
 /// Results of distribution analysis
@@ -147,7 +153,7 @@ pub struct DistributionResults {
 pub struct QualityResults {
     pub function_name: String,
     pub avalanche: AvalancheResults,
-    pub differential: DifferentialResults,
+    pub collisions: CollisionResults,
     pub distribution: DistributionResults,
 }
 
@@ -320,90 +326,107 @@ where
     }
 }
 
-/// Optimized parallel differential pattern analysis
-pub fn test_differential<H, F>(
-    thread_pool: &mut fu::ThreadPool,
-    hash_function: F,
-    ngram_size: usize,
-    num_bits_to_flip: usize,
-    num_samples: usize,
-) -> DifferentialResults
-where
-    H: HashValue + Send + Sync,
-    F: Fn(&[u8]) -> H + Send + Sync,
-{
-    use std::sync::atomic::{AtomicUsize, Ordering};
+/// Atomic bitset for collision detection (4GB = 2^32 bits)
+struct AtomicBitSet {
+    // Use u64 chunks for atomic operations, each covering 64 bits
+    chunks: Vec<AtomicU64>,
+}
 
-    // Generate test data buffer once
-    let test_buffer_size = ngram_size + num_samples;
-    let test_buffer = generate_test_buffer(test_buffer_size, 123);
+impl AtomicBitSet {
+    fn new() -> Self {
+        // 2^32 bits = 2^29 u64 chunks (512MB)
+        let num_chunks = (1u64 << 32) / 64;
+        let mut chunks = Vec::with_capacity(num_chunks as usize);
+        for _ in 0..num_chunks {
+            chunks.push(AtomicU64::new(0));
+        }
+        Self { chunks }
+    }
 
-    // Pre-allocate thread-local scratch buffers
-    let num_worker_threads = thread_pool.threads();
-    let mut worker_scratch_buffers: Vec<Vec<u8>> = (0..num_worker_threads)
-        .map(|_| vec![0u8; ngram_size])
-        .collect();
+    /// Test and set a bit atomically. Returns true if bit was already set (collision)
+    fn test_and_set(&self, bit_index: u32) -> bool {
+        let chunk_index = (bit_index / 64) as usize;
+        let bit_offset = bit_index % 64;
+        let bit_mask = 1u64 << bit_offset;
 
-    // Atomic collision counter (thread-safe)
-    let collision_counter = AtomicUsize::new(0);
-
-    // Safety: Each thread accesses only its own dedicated buffer
-    let scratch_buffers_base_ptr = worker_scratch_buffers.as_mut_ptr() as usize;
-
-    thread_pool.for_n(num_samples, |worker_context| {
-        let ngram_start_index = worker_context.task_index;
-        let worker_thread_id = worker_context.thread_index;
-
-        // Early return for out-of-bounds samples
-        if ngram_start_index + ngram_size > test_buffer.len() {
-            return;
+        if chunk_index >= self.chunks.len() {
+            return false; // Out of bounds
         }
 
-        let current_ngram = &test_buffer[ngram_start_index..ngram_start_index + ngram_size];
-        let baseline_hash = hash_function(current_ngram);
-
-        // Get thread-local scratch buffer
-        let scratch_buffer =
-            unsafe { &mut *(scratch_buffers_base_ptr as *mut Vec<u8>).add(worker_thread_id) };
-
-        // Create variant with specified number of bits flipped
-        scratch_buffer.copy_from_slice(current_ngram);
-
-        // Flip the first num_bits_to_flip bits
-        for bit_index in 0..num_bits_to_flip {
-            let target_byte_index = bit_index / 8;
-            let target_bit_index = bit_index % 8;
-            if target_byte_index < ngram_size {
-                scratch_buffer[target_byte_index] ^= 1 << target_bit_index;
-            }
-        }
-
-        let perturbed_hash = hash_function(scratch_buffer);
-
-        // Check for collision (thread-safe)
-        if baseline_hash == perturbed_hash {
-            collision_counter.fetch_add(1, Ordering::Relaxed);
-        }
-    });
-
-    let total_collisions = collision_counter.load(Ordering::Relaxed);
-
-    // Calculate expected collision rate based on hash space size
-    let hash_space_size = 2.0_f64.powi(H::total_bits() as i32);
-    let expected_collision_rate = (num_samples as f64) / hash_space_size;
-    let collision_ratio = total_collisions as f64 / expected_collision_rate.max(1e-10);
-
-    DifferentialResults {
-        expected_collisions: expected_collision_rate,
-        actual_collisions: total_collisions,
-        collision_ratio,
-        worst_pattern: None, // Could be enhanced to track problematic bit patterns
-        total_tests: num_samples,
+        let old_value = self.chunks[chunk_index].fetch_or(bit_mask, Ordering::Relaxed);
+        (old_value & bit_mask) != 0 // Return true if bit was already set
     }
 }
 
-/// Optimized parallel distribution uniformity analysis
-pub fn test_distribution<H, F>(
+/// Test for u32 collisions in sequential integer inputs
+pub fn test_u32_collisions<F>(
+    thread_pool: &mut fu::ThreadPool,
+    hash_function: F,
+    max_samples: usize,
+) -> CollisionResults
+where
+    F: Fn(&[u8]) -> u64 + Send + Sync,
+{
+    // Expected collision point using birthday paradox: ~sqrt(2^32) ≈ 65,536
+    let expected_collision_at = ((1u64 << 32) as f64).sqrt() as usize * 2; // ~131k with some margin
+
+    // Create atomic bitset for collision detection
+    let bitset = AtomicBitSet::new();
+
+    // Atomic counters for collision detection
+    let total_collisions = AtomicU64::new(0); // Total collision count
+    let first_collision = AtomicU64::new(u64::MAX); // Index of first collision
+    let collision_value = AtomicU64::new(0); // The hash value that collided
+
+    thread_pool.for_n(max_samples, |worker_context| {
+        let i = worker_context.task_index;
+
+        // Hash the integer as little-endian bytes
+        let input_bytes = (i as u64).to_le_bytes();
+        let hash_val = hash_function(&input_bytes);
+        let low32 = hash_val as u32;
+
+        // Test and set bit atomically
+        if bitset.test_and_set(low32) {
+            // Collision detected! Increment total count
+            total_collisions.fetch_add(1, Ordering::Relaxed);
+
+            // Record if this is the first collision
+            let current_first = first_collision.load(Ordering::Relaxed);
+            if (i as u64) < current_first {
+                first_collision.store(i as u64, Ordering::Relaxed);
+                collision_value.store(low32 as u64, Ordering::Relaxed);
+            }
+        }
+    });
+
+    let total_collision_count = total_collisions.load(Ordering::Relaxed) as usize;
+    let first_collision_idx = first_collision.load(Ordering::Relaxed);
+    let collision_val = collision_value.load(Ordering::Relaxed);
+
+    let (first_collision_at, collision_value_opt) = if first_collision_idx == u64::MAX {
+        (None, None)
+    } else {
+        (
+            Some(first_collision_idx as usize),
+            Some(collision_val as u32),
+        )
+    };
+
+    let collision_rate = total_collision_count as f64 / max_samples as f64;
+
+    CollisionResults {
+        total_collisions: total_collision_count,
+        first_collision_at,
+        collision_value: collision_value_opt,
+        expected_collision_at,
+        total_tests: max_samples,
+        collision_rate,
+    }
+}
+
+/// Optimized parallel bucket distribution uniformity analysis
+pub fn test_buckets_distribution<H, F>(
     thread_pool: &mut fu::ThreadPool,
     hash_function: F,
     ngram_size: usize,
@@ -489,24 +512,127 @@ where
     }
 }
 
+/// Detailed test result for individual N-gram sizes (used in verbose mode)
+#[derive(Debug, Serialize, Deserialize, Tabled)]
+struct DetailedTestResult {
+    #[tabled(rename = "Hash Function")]
+    hash_name: String,
+    #[tabled(rename = "N-gram Size")]
+    ngram_size: usize,
+    #[tabled(rename = "N-grams Tested")]
+    ngrams_tested: usize,
+    #[tabled(rename = "Avalanche Bias")]
+    avalanche_bias_display: String,
+    #[tabled(rename = "u32 ⨳")]
+    total_collisions: usize,
+    #[tabled(rename = "First Collision")]
+    first_collision_display: String,
+    #[tabled(rename = "Chi²")]
+    distribution_score_display: String,
+    #[serde(skip)]
+    #[tabled(skip)]
+    avalanche_bias: f64,
+    #[serde(skip)]
+    #[tabled(skip)]
+    distribution_score: f64,
+    #[serde(skip)]
+    #[tabled(skip)]
+    total_collisions_count: usize,
+}
+
+/// Aggregated test result for main summary table and CSV export
+#[derive(Debug, Serialize, Deserialize, Tabled)]
+struct TestResult {
+    #[tabled(rename = "Function")]
+    hash_name: String,
+    #[tabled(rename = "Avg.Bias")]
+    avg_bias_display: String,
+    #[tabled(rename = "Worst.Bias")]
+    worst_bias_display: String,
+    #[tabled(rename = "u32 ⨳")]
+    total_collisions: usize,
+    #[tabled(rename = "Chi²")]
+    avg_chi_square_display: String,
+    #[serde(skip)]
+    #[tabled(skip)]
+    avg_bias: f64,
+    #[serde(skip)]
+    #[tabled(skip)]
+    worst_bias: f64,
+}
+
+/// Aggregate detailed results by hash function
+fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult> {
+    use std::collections::HashMap;
+
+    let mut hash_function_data: HashMap<String, Vec<&DetailedTestResult>> = HashMap::new();
+
+    // Group results by hash function
+    for result in detailed_results {
+        hash_function_data
+            .entry(result.hash_name.clone())
+            .or_insert_with(Vec::new)
+            .push(result);
+    }
+
+    // Aggregate each hash function's results
+    let mut aggregated = Vec::new();
+
+    for (hash_name, results) in hash_function_data {
+        let avg_bias = results.iter().map(|r| r.avalanche_bias).sum::<f64>() / results.len() as f64;
+        let worst_bias = results
+            .iter()
+            .map(|r| r.avalanche_bias)
+            .fold(0.0f64, |acc, bias| acc.max(bias));
+        let avg_chi_square =
+            results.iter().map(|r| r.distribution_score).sum::<f64>() / results.len() as f64;
+
+        // Sum total collisions across all n-gram sizes
+        let total_collisions_sum = results
+            .iter()
+            .map(|r| r.total_collisions_count)
+            .sum::<usize>();
+
+        aggregated.push(TestResult {
+            hash_name,
+            avg_bias_display: format!("{:.5}%", avg_bias),
+            worst_bias_display: format!("{:.5}%", worst_bias),
+            total_collisions: total_collisions_sum,
+            avg_chi_square_display: format!("{:.3}", avg_chi_square),
+            avg_bias,
+            worst_bias,
+        });
+    }
+
+    // Sort by average bias (best first - lowest average bias is more statistically significant)
+    aggregated.sort_by(|a, b| a.avg_bias.partial_cmp(&b.avg_bias).unwrap());
+
+    aggregated
+}
+
+/// Export test results to CSV file
+fn export_to_csv(results: &[TestResult], path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::create(path)?;
+    let mut writer = csv::Writer::from_writer(file);
+
+    for result in results {
+        writer.serialize(result)?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
 /// Test hash functions across multiple n-gram sizes and print tabular results
 fn test_hash_functions_tabular(
     hash_functions: &[Box<dyn HashFunction>],
     ngram_sizes: &[usize],
     samples_per_size: usize,
     verbose: bool,
+    csv_output: Option<&str>,
 ) {
-    // Collect results for all hash functions and n-gram sizes
-    struct TestResult {
-        hash_name: String,
-        ngram_size: usize,
-        avalanche_bias: f64,
-        differential_collisions: usize,
-        distribution_score: f64,
-        ngrams_tested: usize,
-    }
-
-    let mut all_results = Vec::new();
+    // Collect detailed results for all hash functions and n-gram sizes
+    let mut detailed_results = Vec::new();
 
     // Create thread pool once for all tests
     let num_cores = fu::count_logical_cores();
@@ -537,22 +663,27 @@ fn test_hash_functions_tabular(
             print!("  Testing {}...", hash_func.name());
 
             // Run tests based on bit width
-            let (avalanche, differential, distribution, actual_samples) = if hash_func.bits() == 64
-            {
+            let (avalanche, collisions, distribution, actual_samples) = if hash_func.bits() == 64 {
                 let aval = test_avalanche(
                     &mut pool,
                     |d| hash_func.hash(d),
                     *ngram_size,
                     effective_samples,
                 );
-                let diff = test_differential(
-                    &mut pool,
-                    |d| hash_func.hash(d),
-                    *ngram_size,
-                    1,
-                    effective_samples,
-                );
-                let dist = test_distribution(
+                // Only run collision tests for 4-grams
+                let collisions = if *ngram_size == 4 {
+                    test_u32_collisions(&mut pool, |d| hash_func.hash(d), effective_samples)
+                } else {
+                    CollisionResults {
+                        total_collisions: 0,
+                        first_collision_at: None,
+                        collision_value: None,
+                        expected_collision_at: 0,
+                        total_tests: 0,
+                        collision_rate: 0.0,
+                    }
+                };
+                let dist = test_buckets_distribution(
                     &mut pool,
                     |d| hash_func.hash(d),
                     *ngram_size,
@@ -560,7 +691,7 @@ fn test_hash_functions_tabular(
                     1024,
                 );
                 let samples = effective_samples.min(dist.bucket_count * 10); // Actual samples tested
-                (aval, diff, dist, samples)
+                (aval, collisions, dist, samples)
             } else {
                 let aval = test_avalanche(
                     &mut pool,
@@ -568,14 +699,20 @@ fn test_hash_functions_tabular(
                     *ngram_size,
                     effective_samples,
                 );
-                let diff = test_differential(
-                    &mut pool,
-                    |d| hash_func.hash(d) as u32,
-                    *ngram_size,
-                    1,
-                    effective_samples,
-                );
-                let dist = test_distribution(
+                // Only run collision tests for 4-grams
+                let collisions = if *ngram_size == 4 {
+                    test_u32_collisions(&mut pool, |d| hash_func.hash(d), effective_samples)
+                } else {
+                    CollisionResults {
+                        total_collisions: 0,
+                        first_collision_at: None,
+                        collision_value: None,
+                        expected_collision_at: 0,
+                        total_tests: 0,
+                        collision_rate: 0.0,
+                    }
+                };
+                let dist = test_buckets_distribution(
                     &mut pool,
                     |d| hash_func.hash(d) as u32,
                     *ngram_size,
@@ -583,7 +720,7 @@ fn test_hash_functions_tabular(
                     1024,
                 );
                 let samples = effective_samples.min(dist.bucket_count * 10);
-                (aval, diff, dist, samples)
+                (aval, collisions, dist, samples)
             };
 
             // Show detailed stats immediately if verbose mode
@@ -604,90 +741,98 @@ fn test_hash_functions_tabular(
 
                 println!(" done");
                 println!(
-                    "    └─ Avalanche: avg={:.2}%, worst_bias={:.3}%, variance={:.2}",
+                    "    └─ Avalanche: avg={:.3}%, worst_bias={:.5}%, variance={:.3}",
                     avalanche.average_avalanche, avalanche.worst_bias, avalanche.variance
                 );
                 println!(
-                    "    └─ Best bit {}: {:.2}%, Worst bit {}: {:.2}%",
+                    "    └─ Best bit {}: {:.3}%, Worst bit {}: {:.3}%",
                     best_bit.0, best_bit.1, worst_bit.0, worst_bit.1
                 );
-                println!(
-                    "    └─ Distribution: score={:.1}%, chi²={:.1}",
-                    distribution.uniformity_score, distribution.chi_square
-                );
-                println!(
-                    "    └─ Differential: {} collisions (expected {:.2})",
-                    differential.actual_collisions, differential.expected_collisions
-                );
+                println!("    └─ Distribution: Chi²={:.3}", distribution.chi_square);
+                if collisions.total_collisions > 0 {
+                    match collisions.first_collision_at {
+                        Some(pos) => println!(
+                            "    └─ u32 ⨳: {} collisions, first at {} (expected at √n ~ {})",
+                            collisions.total_collisions, pos, collisions.expected_collision_at
+                        ),
+                        None => {
+                            println!(
+                                "    └─ u32 ⨳: {} collisions",
+                                collisions.total_collisions
+                            )
+                        }
+                    }
+                } else {
+                    println!(
+                        "    └─ u32 ⨳: No collisions in {} samples",
+                        collisions.total_tests
+                    );
+                }
             } else {
                 println!(" done");
             }
 
-            all_results.push(TestResult {
+            let collision_display = match collisions.first_collision_at {
+                Some(pos) => format!("@{}", pos),
+                None => "None".to_string(),
+            };
+
+            detailed_results.push(DetailedTestResult {
                 hash_name: hash_func.name().to_string(),
                 ngram_size: *ngram_size,
-                avalanche_bias: avalanche.worst_bias,
-                differential_collisions: differential.actual_collisions,
-                distribution_score: distribution.uniformity_score,
                 ngrams_tested: actual_samples,
+                avalanche_bias_display: format!("{:.5}%", avalanche.worst_bias),
+                total_collisions: collisions.total_collisions,
+                first_collision_display: collision_display,
+                distribution_score_display: format!("{:.3}", distribution.chi_square),
+                avalanche_bias: avalanche.worst_bias,
+                distribution_score: distribution.chi_square,
+                total_collisions_count: collisions.total_collisions,
             });
         }
     }
 
-    // Print tabular results
-    println!("\n{}", "=".repeat(120));
-    println!("COMPREHENSIVE HASH QUALITY ANALYSIS - TABULAR RESULTS");
-    println!("{}", "=".repeat(120));
+    // Aggregate results by hash function for main summary table
+    let aggregated_results = aggregate_results(&detailed_results);
 
-    // Print header
-    println!(
-        "{:<12} | {:>8} | {:>12} | {:>10} | {:>10} | {:>12} | {:>10}",
-        "Hash", "N-gram", "N-grams", "Avalanche", "Quality", "Diff.Colls", "Dist.Score"
-    );
-    println!(
-        "{:<12} | {:>8} | {:>12} | {:>10} | {:>10} | {:>12} | {:>10}",
-        "Function", "Size", "Tested", "Bias %", "", "(expect 0)", "%"
-    );
-    println!("{}", "-".repeat(120));
+    // Print tabular results using tabled
+    println!();
+    println!("Hash Quality Analysis:");
+    println!();
 
-    // Print results
-    for result in &all_results {
-        let avalanche_quality = if result.avalanche_bias < 0.1 {
-            "EXCELLENT"
-        } else if result.avalanche_bias < 0.5 {
-            "VERY GOOD"
-        } else if result.avalanche_bias < 1.0 {
-            "GOOD"
-        } else if result.avalanche_bias < 2.0 {
-            "FAIR"
-        } else {
-            "POOR"
-        };
+    let table = Table::new(&aggregated_results)
+        .with(Style::psql())
+        .modify(tabled::settings::object::Columns::new(1..5), Alignment::right())
+        .to_string();
+    println!("{}", table);
 
-        println!(
-            "{:<12} | {:>8} | {:>12} | {:>10.3} | {:>10} | {:>12} | {:>10.1}",
-            result.hash_name,
-            result.ngram_size,
-            result.ngrams_tested,
-            result.avalanche_bias,
-            avalanche_quality,
-            result.differential_collisions,
-            result.distribution_score
-        );
+    // Export to CSV if requested
+    if let Some(csv_path) = csv_output {
+        match export_to_csv(&aggregated_results, csv_path) {
+            Ok(()) => println!("\nResults exported to: {}", csv_path),
+            Err(e) => eprintln!("Failed to export CSV: {}", e),
+        }
     }
 
-    println!("{}", "=".repeat(120));
-
     // Summary statistics by n-gram size
-    println!("\nSUMMARY BY N-GRAM SIZE:");
-    println!(
-        "{:<10} | {:>15} | {:>15} | {:>15}",
-        "N-gram", "Best Avalanche", "Worst Avalanche", "Avg Dist.Score"
-    );
-    println!("{}", "-".repeat(70));
+    #[derive(Debug, Serialize, Deserialize, Tabled)]
+    struct NGramSummary {
+        #[tabled(rename = "N-gram")]
+        ngram_size: usize,
+        #[tabled(rename = "Best Function")]
+        best_function: String,
+        #[tabled(rename = "Best Bias")]
+        best_bias: String,
+        #[tabled(rename = "Worst Function")]
+        worst_function: String,
+        #[tabled(rename = "Worst Bias")]
+        worst_bias: String,
+    }
+
+    let mut ngram_summaries = Vec::new();
 
     for ngram_size in ngram_sizes {
-        let size_results: Vec<_> = all_results
+        let size_results: Vec<_> = detailed_results
             .iter()
             .filter(|r| r.ngram_size == *ngram_size)
             .collect();
@@ -701,21 +846,25 @@ fn test_hash_functions_tabular(
                 .iter()
                 .max_by(|a, b| a.avalanche_bias.partial_cmp(&b.avalanche_bias).unwrap())
                 .unwrap();
-            let avg_dist = size_results
-                .iter()
-                .map(|r| r.distribution_score)
-                .sum::<f64>()
-                / size_results.len() as f64;
 
-            println!(
-                "{:<10} | {:>15} | {:>15} | {:>15.1}",
-                ngram_size,
-                format!("{} ({:.3}%)", best.hash_name, best.avalanche_bias),
-                format!("{} ({:.3}%)", worst.hash_name, worst.avalanche_bias),
-                avg_dist
-            );
+            ngram_summaries.push(NGramSummary {
+                ngram_size: *ngram_size,
+                best_function: best.hash_name.clone(),
+                best_bias: format!("{:.5}%", best.avalanche_bias),
+                worst_function: worst.hash_name.clone(),
+                worst_bias: format!("{:.5}%", worst.avalanche_bias),
+            });
         }
     }
+
+    println!();
+    println!("Summary by N-gram size:");
+    println!();
+    let summary_table = Table::new(&ngram_summaries)
+        .with(Style::psql())
+        .modify(tabled::settings::object::Columns::new(2..5), Alignment::right())
+        .to_string();
+    println!("{}", summary_table);
 }
 
 /// Command line arguments
@@ -743,6 +892,10 @@ struct Args {
     /// Show detailed statistics for each individual test
     #[arg(long = "verbose", short = 'v')]
     verbose: bool,
+
+    /// Export results to CSV file
+    #[arg(long = "csv", value_name = "FILE")]
+    csv_output: Option<String>,
 }
 
 fn parse_ngram_sizes(s: &str) -> Result<Vec<usize>, String> {
@@ -811,11 +964,19 @@ fn main() {
             .sum::<usize>()
     );
 
-    test_hash_functions_tabular(&hash_functions, &ngram_sizes, args.samples, args.verbose);
+    test_hash_functions_tabular(
+        &hash_functions,
+        &ngram_sizes,
+        args.samples,
+        args.verbose,
+        args.csv_output.as_deref(),
+    );
 
     println!("\nNotes:");
     println!("- Avalanche bias: <0.1% (excellent), <0.5% (very good), <1.0% (good)");
-    println!("- Distribution score: Higher is better (100% = perfect uniformity)");
-    println!("- Differential collisions: Should be 0 or very close to 0");
-    println!("- CRC32 is expected to have poor avalanche (not designed for it)");
+    println!("- Chi²: Lower values indicate better distribution uniformity");
+    println!("- u32 ⨳: Tests low 32-bits on sequential integers [0,1,2,...] (only for 4-grams)");
+    println!("  Expected first collision ~√(2³²) ≈ 65,536 by birthday paradox");
+    println!("  Early collisions (<10k) suggest hash weakness, late (>500k) suggest bias");
+    println!("- Crc32 is expected to have poor avalanche (not designed for it)");
 }

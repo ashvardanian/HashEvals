@@ -113,11 +113,11 @@ impl HashFunction for GxHashFunction {
 }
 
 /// CRC32 function
-pub struct CRC32Function;
+pub struct Crc32Function;
 
-impl HashFunction for CRC32Function {
+impl HashFunction for Crc32Function {
     fn name(&self) -> &'static str {
-        "CRC32"
+        "Crc32"
     }
     fn bits(&self) -> u32 {
         32
@@ -132,7 +132,7 @@ pub struct Murmur3Function;
 
 impl HashFunction for Murmur3Function {
     fn name(&self) -> &'static str {
-        "Murmur3"
+        "MurMur3"
     }
     fn bits(&self) -> u32 {
         64
@@ -185,7 +185,7 @@ pub fn get_all_hash_functions() -> Vec<Box<dyn HashFunction>> {
         Box::new(AHashFunction::new()),
         Box::new(XXHash3Function),
         Box::new(GxHashFunction),
-        Box::new(CRC32Function),
+        Box::new(Crc32Function),
         Box::new(Murmur3Function),
         Box::new(CityHashFunction),
         Box::new(Blake3Function),

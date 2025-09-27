@@ -186,21 +186,6 @@ impl HashFunction for Blake3Function {
     }
 }
 
-/// Adler32 function
-pub struct AdlerFunction;
-
-impl HashFunction for AdlerFunction {
-    fn name(&self) -> &'static str {
-        "Adler32"
-    }
-    fn bits(&self) -> u32 {
-        32
-    }
-    fn hash(&self, data: &[u8]) -> u64 {
-        adler::adler32_slice(data) as u64
-    }
-}
-
 /// FxHash function
 pub struct FxHashFunction {
     builder: FxBuildHasher,
@@ -306,7 +291,6 @@ pub fn get_all_hash_functions() -> Vec<Box<dyn HashFunction>> {
         Box::new(Murmur3Function),
         Box::new(CityHashFunction),
         Box::new(Blake3Function),
-        Box::new(AdlerFunction),
         Box::new(FxHashFunction::new()),
         Box::new(FoldHashFunction::new()),
         Box::new(SeaHashFunction),

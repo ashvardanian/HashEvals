@@ -103,88 +103,6 @@ where
     duration.as_micros() as u64
 }
 
-fn find_bias_leaders(results: &[&DetailedTestResult]) -> String {
-    if results.is_empty() {
-        return "N/A".to_string();
-    }
-
-    // Find the best (lowest) bias
-    let best_bias = results
-        .iter()
-        .map(|r| r.avalanche_bias)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap();
-
-    // Find all results that have the best bias (ties)
-    let mut leaders: Vec<String> = results
-        .iter()
-        .filter(|r| (r.avalanche_bias - best_bias).abs() < 1e-10) // Handle floating point precision
-        .map(|r| r.hash_name.clone())
-        .collect();
-
-    // Limit display to avoid overly long cells
-    const MAX_LEADERS_DISPLAYED: usize = 3;
-    if leaders.len() > MAX_LEADERS_DISPLAYED {
-        let remaining_count = leaders.len() - MAX_LEADERS_DISPLAYED;
-        leaders.truncate(MAX_LEADERS_DISPLAYED);
-        leaders.push(format!("+ {} others", remaining_count));
-    }
-
-    leaders.join(", ")
-}
-
-fn find_speed_leaders(results: &[&DetailedTestResult]) -> String {
-    if results.is_empty() {
-        return "N/A".to_string();
-    }
-
-    // Find the best (lowest) duration
-    let best_duration = results.iter().map(|r| r.duration_us).min().unwrap();
-
-    // Find all results that have the best duration (ties)
-    let mut leaders: Vec<String> = results
-        .iter()
-        .filter(|r| r.duration_us == best_duration)
-        .map(|r| r.hash_name.clone())
-        .collect();
-
-    // Limit display to avoid overly long cells
-    const MAX_LEADERS_DISPLAYED: usize = 3;
-    if leaders.len() > MAX_LEADERS_DISPLAYED {
-        let remaining_count = leaders.len() - MAX_LEADERS_DISPLAYED;
-        leaders.truncate(MAX_LEADERS_DISPLAYED);
-        leaders.push(format!("+ {} others", remaining_count));
-    }
-
-    leaders.join(", ")
-}
-
-fn find_collision_leaders(results: &[&DetailedTestResult]) -> String {
-    if results.is_empty() {
-        return "N/A".to_string();
-    }
-
-    // Find the best (lowest) collision count
-    let best_collisions = results.iter().map(|r| r.total_collisions).min().unwrap();
-
-    // Find all results that have the best collision count (ties)
-    let mut leaders: Vec<String> = results
-        .iter()
-        .filter(|r| r.total_collisions == best_collisions)
-        .map(|r| r.hash_name.clone())
-        .collect();
-
-    // Limit display to avoid overly long cells
-    const MAX_LEADERS_DISPLAYED: usize = 3;
-    if leaders.len() > MAX_LEADERS_DISPLAYED {
-        let remaining_count = leaders.len() - MAX_LEADERS_DISPLAYED;
-        leaders.truncate(MAX_LEADERS_DISPLAYED);
-        leaders.push(format!("+ {} others", remaining_count));
-    }
-
-    leaders.join(", ")
-}
-
 /// Trait for hash values that can be analyzed for quality
 pub trait HashValue: Copy + PartialEq + std::fmt::Debug {
     fn xor(self, other: Self) -> Self;
@@ -277,6 +195,27 @@ where
     let num_output_bits = H::total_bits() as usize;
     let num_input_bits_per_ngram = ngram_size * 8;
 
+    // For large n-grams (N > 8), randomly sample 64 unique bit positions to avoid quadratic complexity
+    let bit_positions_to_test: Vec<usize> = if ngram_size > 8 {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed.wrapping_add(0x9e3779b97f4a7c15));
+        let mut positions: Vec<usize> = (0..num_input_bits_per_ngram).collect();
+
+        // Fisher-Yates shuffle to get random unique positions
+        for i in (1..positions.len()).rev() {
+            let j = rng.random_range(0..=i);
+            positions.swap(i, j);
+        }
+
+        // Take first 64 positions (or all if fewer than 64)
+        positions
+            .into_iter()
+            .take(64.min(num_input_bits_per_ngram))
+            .collect()
+    } else {
+        // For small n-grams, test all bit positions
+        (0..num_input_bits_per_ngram).collect()
+    };
+
     // Pre-allocate thread-local resources to avoid contention
     let num_worker_threads = thread_pool.threads();
     let mut worker_scratch_buffers: Vec<Vec<u8>> = (0..num_worker_threads)
@@ -310,8 +249,8 @@ where
         let bit_flip_counters =
             unsafe { &mut *(bit_counters_base_ptr as *mut Vec<usize>).add(worker_thread_id) };
 
-        // Test each input bit flip for avalanche effect
-        for input_bit_position in 0..num_input_bits_per_ngram {
+        // Test selected input bit positions for avalanche effect
+        for &input_bit_position in &bit_positions_to_test {
             let target_byte_index = input_bit_position / 8;
             let target_bit_index = input_bit_position % 8;
 
@@ -343,7 +282,7 @@ where
 
     // Calculate total avalanche tests performed
     let valid_ngram_count = num_samples.min(test_buffer.len().saturating_sub(ngram_size - 1));
-    let total_avalanche_tests = valid_ngram_count * num_input_bits_per_ngram;
+    let total_avalanche_tests = valid_ngram_count * bit_positions_to_test.len();
 
     // Calculate avalanche percentages for each output bit
     let avalanche_percentages: Vec<f64> = total_bit_flip_counts
@@ -542,7 +481,7 @@ where
 }
 
 /// Detailed test result for individual N-gram sizes (used in verbose mode)
-#[derive(Debug, Serialize, Deserialize, Tabled)]
+#[derive(Debug, Clone, Serialize, Deserialize, Tabled)]
 struct DetailedTestResult {
     #[tabled(rename = "Hash Function")]
     hash_name: String,
@@ -553,7 +492,7 @@ struct DetailedTestResult {
     #[tabled(rename = "Avalanche Bias")]
     avalanche_bias_display: String,
     #[tabled(rename = "Integral ⨳")]
-    total_collisions: usize,
+    collision_rate_display: String,
     #[tabled(rename = "1st Collision")]
     first_collision_display: String,
     #[tabled(rename = "Chi²")]
@@ -564,6 +503,9 @@ struct DetailedTestResult {
     #[serde(skip)]
     #[tabled(skip)]
     distribution_score: f64,
+    #[serde(skip)]
+    #[tabled(skip)]
+    collision_rate: f64,
     #[serde(rename = "duration_us")]
     #[tabled(skip)]
     duration_us: u64,
@@ -621,15 +563,15 @@ fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult>
         let avg_chi_square =
             results.iter().map(|r| r.distribution_score).sum::<f64>() / results.len() as f64;
 
-        // Sum total collisions across all n-gram sizes
-        let total_collisions_sum = results.iter().map(|r| r.total_collisions).sum::<usize>();
-
-        // Sum total samples across all n-gram sizes for collision percentage
-        let total_samples = results.iter().map(|r| r.ngrams_tested).sum::<usize>();
-
-        // Calculate collision percentage
-        let collision_percentage = if total_samples > 0 {
-            (total_collisions_sum as f64 / total_samples as f64) * 100.0
+        // Average collision rates only from n-gram sizes ≤ 8 (where collision tests are run)
+        let collision_results: Vec<_> = results.iter().filter(|r| r.ngram_size <= 8).collect();
+        let collision_percentage = if !collision_results.is_empty() {
+            (collision_results
+                .iter()
+                .map(|r| r.collision_rate)
+                .sum::<f64>()
+                / collision_results.len() as f64)
+                * 100.0
         } else {
             0.0
         };
@@ -656,7 +598,7 @@ fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult>
             total_collisions_display: format!("{:.3} %", collision_percentage),
             avg_chi_square_display: format!("{:.3}", avg_chi_square),
             throughput_display: format!("{:.1} MiB/s", aggregated_throughput_mib_per_sec),
-            total_collisions: total_collisions_sum,
+            total_collisions: collision_percentage as usize,
             duration_us: total_duration_us,
             avg_bias,
         });
@@ -853,14 +795,14 @@ fn test_hash_functions_tabular(
                 println!(" done");
             }
 
-            let (total_collisions, collision_display) = if let Some(collisions) = &collisions_opt {
+            let (collision_rate, collision_display) = if let Some(collisions) = &collisions_opt {
                 let display = match collisions.first_collision_at {
                     Some(pos) => format!("@{}", format_thousands(pos)),
                     None => "None".to_string(),
                 };
-                (collisions.total_collisions, display)
+                (collisions.collision_rate, display)
             } else {
-                (0, "N/A".to_string())
+                (0.0, "N/A".to_string())
             };
 
             detailed_results.push(DetailedTestResult {
@@ -868,11 +810,12 @@ fn test_hash_functions_tabular(
                 ngram_size: *ngram_size,
                 ngrams_tested: actual_samples,
                 avalanche_bias_display: format!("{:.5} %", avalanche.worst_bias),
-                total_collisions,
+                collision_rate_display: format!("{:.3} %", collision_rate * 100.0),
                 first_collision_display: collision_display,
                 distribution_score_display: format!("{:.3}", distribution.chi_square),
                 avalanche_bias: avalanche.worst_bias,
                 distribution_score: distribution.chi_square,
+                collision_rate,
                 duration_us,
             });
         }
@@ -903,48 +846,117 @@ fn test_hash_functions_tabular(
         }
     }
 
-    // Leaders by n-gram size
-    #[derive(Debug, Serialize, Deserialize, Tabled)]
-    struct NGramSummary {
-        #[tabled(rename = "N-gram")]
-        ngram_size: usize,
-        #[tabled(rename = "Lowest Bias")]
-        lowest_bias_leaders: String,
-        #[tabled(rename = "Lowest Collisions")]
-        lowest_collisions_leaders: String,
-        #[tabled(rename = "Highest Speed")]
-        highest_speed_leaders: String,
+    // Print filtered summary tables by n-gram size categories
+
+    // Helper function to create filtered aggregated results
+    let create_filtered_results = |min_size: usize, max_size: usize| -> Vec<TestResult> {
+        let filtered_detailed: Vec<_> = detailed_results
+            .iter()
+            .filter(|r| r.ngram_size >= min_size && r.ngram_size <= max_size)
+            .cloned()
+            .collect();
+        aggregate_results(&filtered_detailed)
+    };
+
+    // Tiny: ≤ 8 bytes
+    let tiny_results = create_filtered_results(1, 8);
+    if !tiny_results.is_empty() {
+        println!();
+        println!("Hash Quality Analysis - Tiny N-grams (≤ 8 bytes):");
+        println!();
+        let table = Table::new(&tiny_results)
+            .with(Style::psql())
+            .modify(
+                tabled::settings::object::Columns::new(1..6),
+                Alignment::right(),
+            )
+            .to_string();
+        println!("{}", table);
     }
 
-    let mut ngram_summaries = Vec::new();
+    // Short: 9-32 bytes (no collision column since N > 8)
+    let short_results = create_filtered_results(9, 32);
+    if !short_results.is_empty() {
+        // Create a simplified struct without collision column
+        #[derive(Tabled)]
+        struct ShortTestResult {
+            #[tabled(rename = "Function")]
+            hash_name: String,
+            #[tabled(rename = "Avg.Bias")]
+            avg_bias_display: String,
+            #[tabled(rename = "Worst.Bias")]
+            worst_bias_display: String,
+            #[tabled(rename = "Chi²")]
+            avg_chi_square_display: String,
+            #[tabled(rename = "Throughput")]
+            throughput_display: String,
+        }
 
-    for ngram_size in ngram_sizes {
-        let size_results: Vec<_> = detailed_results
-            .iter()
-            .filter(|r| r.ngram_size == *ngram_size)
+        let short_simplified: Vec<ShortTestResult> = short_results
+            .into_iter()
+            .map(|r| ShortTestResult {
+                hash_name: r.hash_name,
+                avg_bias_display: r.avg_bias_display,
+                worst_bias_display: r.worst_bias_display,
+                avg_chi_square_display: r.avg_chi_square_display,
+                throughput_display: r.throughput_display,
+            })
             .collect();
 
-        if !size_results.is_empty() {
-            ngram_summaries.push(NGramSummary {
-                ngram_size: *ngram_size,
-                lowest_bias_leaders: find_bias_leaders(&size_results),
-                lowest_collisions_leaders: find_collision_leaders(&size_results),
-                highest_speed_leaders: find_speed_leaders(&size_results),
-            });
-        }
+        println!();
+        println!("Hash Quality Analysis - Short N-grams (9-32 bytes):");
+        println!();
+        let table = Table::new(&short_simplified)
+            .with(Style::psql())
+            .modify(
+                tabled::settings::object::Columns::new(1..5),
+                Alignment::right(),
+            )
+            .to_string();
+        println!("{}", table);
     }
 
-    println!();
-    println!("Leaders by N-gram size:");
-    println!();
-    let summary_table = Table::new(&ngram_summaries)
-        .with(Style::psql())
-        .modify(
-            tabled::settings::object::Columns::new(1..4),
-            Alignment::right(),
-        )
-        .to_string();
-    println!("{}", summary_table);
+    // Long: > 32 bytes (no collision column since N > 8)
+    let long_results = create_filtered_results(33, usize::MAX);
+    if !long_results.is_empty() {
+        // Create a simplified struct without collision column
+        #[derive(Tabled)]
+        struct LongTestResult {
+            #[tabled(rename = "Function")]
+            hash_name: String,
+            #[tabled(rename = "Avg.Bias")]
+            avg_bias_display: String,
+            #[tabled(rename = "Worst.Bias")]
+            worst_bias_display: String,
+            #[tabled(rename = "Chi²")]
+            avg_chi_square_display: String,
+            #[tabled(rename = "Throughput")]
+            throughput_display: String,
+        }
+
+        let long_simplified: Vec<LongTestResult> = long_results
+            .into_iter()
+            .map(|r| LongTestResult {
+                hash_name: r.hash_name,
+                avg_bias_display: r.avg_bias_display,
+                worst_bias_display: r.worst_bias_display,
+                avg_chi_square_display: r.avg_chi_square_display,
+                throughput_display: r.throughput_display,
+            })
+            .collect();
+
+        println!();
+        println!("Hash Quality Analysis - Long N-grams (> 32 bytes):");
+        println!();
+        let table = Table::new(&long_simplified)
+            .with(Style::psql())
+            .modify(
+                tabled::settings::object::Columns::new(1..5),
+                Alignment::right(),
+            )
+            .to_string();
+        println!("{}", table);
+    }
 }
 
 /// Command line arguments
@@ -962,14 +974,11 @@ struct Args {
     list_hashes: bool,
 
     /// Number of samples per n-gram size
-    #[arg(long = "samples", default_value = "1000000")]
+    #[arg(long = "samples", default_value = "100000")]
     samples: usize,
 
     /// N-gram sizes to test (comma-separated)
-    #[arg(
-        long = "ngrams",
-        default_value = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"
-    )]
+    #[arg(long = "ngrams", default_value = "1-20,30,60,100,200,300,400,500")]
     ngram_sizes_str: String,
 
     /// Show detailed statistics for each individual test
@@ -986,13 +995,55 @@ struct Args {
 }
 
 fn parse_ngram_sizes(s: &str) -> Result<Vec<usize>, String> {
-    s.split(',')
-        .map(|size| {
-            size.trim()
+    let mut sizes = Vec::new();
+
+    for part in s.split(',') {
+        let part = part.trim();
+
+        if part.contains('-') {
+            // Handle range like "1-20"
+            let range_parts: Vec<&str> = part.split('-').collect();
+            if range_parts.len() != 2 {
+                return Err(format!(
+                    "Invalid range format '{}': expected 'start-end'",
+                    part
+                ));
+            }
+
+            let start: usize = range_parts[0]
+                .trim()
                 .parse()
-                .map_err(|e| format!("Invalid n-gram size '{}': {}", size, e))
-        })
-        .collect()
+                .map_err(|e| format!("Invalid range start '{}': {}", range_parts[0], e))?;
+            let end: usize = range_parts[1]
+                .trim()
+                .parse()
+                .map_err(|e| format!("Invalid range end '{}': {}", range_parts[1], e))?;
+
+            if start > end {
+                return Err(format!(
+                    "Invalid range '{}': start {} > end {}",
+                    part, start, end
+                ));
+            }
+
+            // Add all values in the range (inclusive)
+            for i in start..=end {
+                sizes.push(i);
+            }
+        } else {
+            // Handle individual value
+            let size: usize = part
+                .parse()
+                .map_err(|e| format!("Invalid n-gram size '{}': {}", part, e))?;
+            sizes.push(size);
+        }
+    }
+
+    // Remove duplicates and sort
+    sizes.sort_unstable();
+    sizes.dedup();
+
+    Ok(sizes)
 }
 
 fn main() {
@@ -1062,12 +1113,21 @@ fn main() {
     println!("  Random seed: {}", args.seed);
     let total_tests = ngram_sizes
         .iter()
-        .map(|&s| s * 8 * args.samples)
+        .map(|&s| {
+            let input_bits = s * 8;
+            let bits_to_test = if s > 8 {
+                64.min(input_bits)
+            } else {
+                input_bits
+            };
+            bits_to_test * args.samples
+        })
         .sum::<usize>();
     println!(
         "  Total avalanche tests: {} bit flips per hash function",
         format_thousands(total_tests)
     );
+    println!("  Optimization: For N > 8, randomly sample 64 unique bit positions to avoid quadratic complexity");
 
     test_hash_functions_tabular(
         &hash_functions,

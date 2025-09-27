@@ -261,7 +261,7 @@ dependencies = [
  "foldhash",
  "fork_union",
  "gxhash",
- "murmur3",
+ "mur3",
  "rand",
  "rand_chacha",
  "rustc-hash",
@@ -304,10 +304,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
-name = "murmur3"
-version = "0.5.2"
+name = "mur3"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9252111cf132ba0929b6f8e030cac2a24b507f3a4d6db6fb2896f27b354c714b"
+checksum = "97af489e1e21b68de4c390ecca6703318bc1aa16e9733bcb62c089b73c6fbb1b"
 
 [[package]]
 name = "once_cell"

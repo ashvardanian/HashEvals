@@ -2,7 +2,6 @@ use ahash::RandomState as AHashState;
 use rustc_hash::FxHasher;
 use siphasher::sip::SipHasher13;
 use std::hash::{BuildHasher, Hasher};
-use std::io::Cursor;
 use stringzilla::sz;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -38,7 +37,7 @@ impl HashFunction for StringZillaHash {
 
 /// SipHash using siphasher crate for proper seeding
 pub struct SipHashFunction {
-    key: [u8; 16],
+    hasher: SipHasher13,
 }
 
 impl SipHashFunction {
@@ -47,7 +46,9 @@ impl SipHashFunction {
         let mut key = [0u8; 16];
         key[0..8].copy_from_slice(&seed.to_le_bytes());
         key[8..16].copy_from_slice(&seed.wrapping_add(0x9e3779b97f4a7c15).to_le_bytes());
-        Self { key }
+        Self {
+            hasher: SipHasher13::new_with_key(&key),
+        }
     }
 }
 
@@ -58,8 +59,10 @@ impl HashFunction for SipHashFunction {
     fn bits(&self) -> u32 {
         64
     }
+
     fn hash(&self, data: &[u8]) -> u64 {
-        let mut hasher = SipHasher13::new_with_key(&self.key);
+        // Clone the hasher to avoid mutation, since we need to reset state
+        let mut hasher = self.hasher.clone();
         hasher.write(data);
         hasher.finish()
     }
@@ -138,13 +141,13 @@ impl HashFunction for GxHashFunction {
 
 /// CRC32 function with seeding support
 pub struct Crc32Function {
-    initial: u32,
+    hasher: crc32fast::Hasher,
 }
 
 impl Crc32Function {
     pub fn with_seed(seed: u64) -> Self {
         Self {
-            initial: seed as u32,
+            hasher: crc32fast::Hasher::new_with_initial(seed as u32),
         }
     }
 }
@@ -157,7 +160,8 @@ impl HashFunction for Crc32Function {
         32
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        let mut hasher = crc32fast::Hasher::new_with_initial(self.initial);
+        // Clone the hasher to get a fresh state
+        let mut hasher = self.hasher.clone();
         hasher.update(data);
         hasher.finalize() as u64
     }
@@ -182,8 +186,8 @@ impl HashFunction for Murmur3Function {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        let mut cursor = Cursor::new(data);
-        murmur3::murmur3_x64_128(&mut cursor, self.seed).unwrap() as u64
+        let (h1, _h2) = mur3::murmurhash3_x64_128(data, self.seed);
+        h1
     }
 }
 
@@ -290,13 +294,13 @@ impl HashFunction for Blake3Function {
 
 /// FxHash function with seeding support
 pub struct FxHashFunction {
-    seed: usize,
+    hasher: FxHasher,
 }
 
 impl FxHashFunction {
     pub fn with_seed(seed: u64) -> Self {
         Self {
-            seed: seed as usize,
+            hasher: FxHasher::with_seed(seed as usize),
         }
     }
 }
@@ -309,7 +313,8 @@ impl HashFunction for FxHashFunction {
         64
     }
     fn hash(&self, data: &[u8]) -> u64 {
-        let mut hasher = FxHasher::with_seed(self.seed);
+        // Clone the hasher to avoid mutation, since we need to reset state
+        let mut hasher = self.hasher.clone();
         hasher.write(data);
         hasher.finish()
     }

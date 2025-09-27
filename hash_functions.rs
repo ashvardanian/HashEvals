@@ -1,9 +1,4 @@
 use ahash::RandomState as AHashState;
-use blake3;
-use cityhash;
-use crc32fast;
-use gxhash;
-use murmur3;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::Cursor;

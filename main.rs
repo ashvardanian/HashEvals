@@ -10,7 +10,7 @@ by systematically testing how input bit patterns affect output distribution.
 ## Test Types
 
 - **Avalanche Test**: Measures how single-bit input changes affect output distribution
-- **Differential Test**: Detects patterns where minimal input differences cause predictable output patterns
+- **Integral Collision Test**: Detects hash collisions using random N-byte inputs
 - **Distribution Test**: Evaluates statistical uniformity of hash outputs
 - **N-gram Analysis**: Tests quality across different input sizes using continuous buffer sampling
 
@@ -37,7 +37,7 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release -- --samples 50000 --ngrams
 
 - **Avalanche Score**: Percentage of output bits that change on single input bit flip (ideal: ~50%)
 - **Bias Score**: Maximum deviation from 50% for any output bit (good: <1%, excellent: <0.1%)
-- **Differential Collisions**: Unexpected collisions in sparse key patterns
+- **Integral Collisions**: Hash collisions on random N-byte little-endian integers
 - **Chi-square**: Statistical measure of output distribution uniformity
 
 "#]
@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::Parser;
 use fork_union as fu;
+use num_format::{Locale, ToFormattedString};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
@@ -67,7 +68,6 @@ pub trait HashValue: Copy + PartialEq + std::fmt::Debug {
     fn count_ones(self) -> u32;
     fn total_bits() -> u32;
     fn to_u64(self) -> u64;
-    fn from_bytes(bytes: &[u8]) -> Self;
 }
 
 impl HashValue for u32 {
@@ -82,15 +82,6 @@ impl HashValue for u32 {
     }
     fn to_u64(self) -> u64 {
         self as u64
-    }
-    fn from_bytes(bytes: &[u8]) -> Self {
-        if bytes.len() >= 4 {
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-        } else {
-            let mut buf = [0u8; 4];
-            buf[..bytes.len()].copy_from_slice(bytes);
-            u32::from_le_bytes(buf)
-        }
     }
 }
 
@@ -107,17 +98,6 @@ impl HashValue for u64 {
     fn to_u64(self) -> u64 {
         self
     }
-    fn from_bytes(bytes: &[u8]) -> Self {
-        if bytes.len() >= 8 {
-            u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ])
-        } else {
-            let mut buf = [0u8; 8];
-            buf[..bytes.len()].copy_from_slice(bytes);
-            u64::from_le_bytes(buf)
-        }
-    }
 }
 
 /// Results of avalanche analysis
@@ -131,12 +111,11 @@ pub struct AvalancheResults {
     pub total_tests: usize,       // Number of bit-flip tests performed
 }
 
-/// Results of u32 collision analysis
+/// Results of collision analysis
 #[derive(Debug)]
 pub struct CollisionResults {
     pub total_collisions: usize,
     pub first_collision_at: Option<usize>,
-    pub collision_value: Option<u32>,
     pub expected_collision_at: usize, // Birthday paradox expectation
     pub total_tests: usize,
     pub collision_rate: f64, // Actual collision rate
@@ -146,18 +125,7 @@ pub struct CollisionResults {
 #[derive(Debug)]
 pub struct DistributionResults {
     pub chi_square: f64,
-    pub p_value: f64,
-    pub uniformity_score: f64,
     pub bucket_count: usize,
-}
-
-/// Comprehensive quality test results
-#[derive(Debug)]
-pub struct QualityResults {
-    pub function_name: String,
-    pub avalanche: AvalancheResults,
-    pub collisions: CollisionResults,
-    pub distribution: DistributionResults,
 }
 
 /// Generate a large continuous random buffer for n-gram testing
@@ -166,45 +134,6 @@ pub fn generate_test_buffer(buffer_size: usize, seed: u64) -> Vec<u8> {
     let mut buffer = vec![0u8; buffer_size];
     rng.fill(&mut buffer[..]);
     buffer
-}
-
-/// Iterator over n-grams in a buffer (zero-copy)
-pub struct NGramIterator<'a> {
-    buffer: &'a [u8],
-    ngram_length: usize,
-    position: usize,
-}
-
-impl<'a> NGramIterator<'a> {
-    pub fn new(buffer: &'a [u8], ngram_length: usize) -> Self {
-        Self {
-            buffer,
-            ngram_length,
-            position: 0,
-        }
-    }
-}
-
-impl<'a> Iterator for NGramIterator<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.position + self.ngram_length <= self.buffer.len() {
-            let ngram = &self.buffer[self.position..self.position + self.ngram_length];
-            self.position += 1;
-            Some(ngram)
-        } else {
-            None
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self
-            .buffer
-            .len()
-            .saturating_sub(self.position + self.ngram_length - 1);
-        (remaining, Some(remaining))
-    }
 }
 
 /// Optimized parallel avalanche analysis using fork_union's for_n
@@ -409,7 +338,6 @@ where
     Some(CollisionResults {
         total_collisions: total_collision_count,
         first_collision_at,
-        collision_value: None, // Not used meaningfully
         expected_collision_at,
         total_tests: num_samples,
         collision_rate,
@@ -481,24 +409,8 @@ where
         })
         .sum();
 
-    // Simplified p-value calculation (chi-square approximation)
-    let degrees_of_freedom = num_buckets - 1;
-    let p_value_estimate = 1.0 - (chi_square_statistic / degrees_of_freedom as f64).min(1.0);
-
-    // Calculate uniformity score (0-100, higher = more uniform)
-    let maximum_relative_deviation = total_bucket_counts
-        .iter()
-        .map(|&count| {
-            ((count as f64 - expected_count_per_bucket) / expected_count_per_bucket).abs()
-        })
-        .fold(0.0f64, |acc, deviation| acc.max(deviation));
-
-    let uniformity_percentage = ((1.0 - maximum_relative_deviation.min(1.0)) * 100.0).max(0.0);
-
     DistributionResults {
         chi_square: chi_square_statistic,
-        p_value: p_value_estimate,
-        uniformity_score: uniformity_percentage,
         bucket_count: num_buckets,
     }
 }
@@ -541,15 +453,14 @@ struct TestResult {
     #[tabled(rename = "Worst.Bias")]
     worst_bias_display: String,
     #[tabled(rename = "Integral ⨳")]
-    total_collisions: usize,
+    total_collisions_display: String,
     #[tabled(rename = "Chi²")]
     avg_chi_square_display: String,
+    #[serde(rename = "total_collisions")]
+    total_collisions: usize,
     #[serde(skip)]
     #[tabled(skip)]
     avg_bias: f64,
-    #[serde(skip)]
-    #[tabled(skip)]
-    worst_bias: f64,
 }
 
 /// Aggregate detailed results by hash function
@@ -588,10 +499,10 @@ fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult>
             hash_name,
             avg_bias_display: format!("{:.5}%", avg_bias),
             worst_bias_display: format!("{:.5}%", worst_bias),
-            total_collisions: total_collisions_sum,
+            total_collisions_display: total_collisions_sum.to_formatted_string(&Locale::en),
             avg_chi_square_display: format!("{:.3}", avg_chi_square),
+            total_collisions: total_collisions_sum,
             avg_bias,
-            worst_bias,
         });
     }
 
@@ -641,12 +552,14 @@ fn test_hash_functions_tabular(
         if effective_samples < samples_per_size {
             println!(
                 "\nTesting {}-grams with {} samples (capped from {} - only 2^{} possible combinations) using {} cores",
-                ngram_size, effective_samples, samples_per_size, ngram_size * 8, num_cores
+                ngram_size, effective_samples.to_formatted_string(&Locale::en), samples_per_size.to_formatted_string(&Locale::en), ngram_size * 8, num_cores
             );
         } else {
             println!(
                 "\nTesting {}-grams with {} samples each... (using {} cores)",
-                ngram_size, effective_samples, num_cores
+                ngram_size,
+                effective_samples.to_formatted_string(&Locale::en),
+                num_cores
             );
         }
 
@@ -730,21 +643,25 @@ fn test_hash_functions_tabular(
                 if let Some(collisions) = &collisions_opt {
                     if collisions.total_collisions > 0 {
                         match collisions.first_collision_at {
-                            Some(pos) => println!(
+                            Some(pos) => {
+                                println!(
                                 "    └─ Integral ⨳: {} collisions, first at {} (expected at ~{})",
-                                collisions.total_collisions, pos, collisions.expected_collision_at
-                            ),
+                                collisions.total_collisions.to_formatted_string(&Locale::en),
+                                pos.to_formatted_string(&Locale::en),
+                                collisions.expected_collision_at.to_formatted_string(&Locale::en)
+                            )
+                            }
                             None => {
                                 println!(
                                     "    └─ Integral ⨳: {} collisions",
-                                    collisions.total_collisions
+                                    collisions.total_collisions.to_formatted_string(&Locale::en)
                                 )
                             }
                         }
                     } else {
                         println!(
                             "    └─ Integral ⨳: No collisions in {} samples",
-                            collisions.total_tests
+                            collisions.total_tests.to_formatted_string(&Locale::en)
                         );
                     }
                 } else {
@@ -757,7 +674,7 @@ fn test_hash_functions_tabular(
             let (total_collisions, collision_display, total_collisions_count) =
                 if let Some(collisions) = &collisions_opt {
                     let display = match collisions.first_collision_at {
-                        Some(pos) => format!("@{}", pos),
+                        Some(pos) => format!("@{}", pos.to_formatted_string(&Locale::en)),
                         None => "None".to_string(),
                     };
                     (
@@ -953,13 +870,17 @@ fn main() {
             .join(", ")
     );
     println!("  N-gram sizes: {:?} bytes", ngram_sizes);
-    println!("  Samples per size: {} n-grams", args.samples);
+    println!(
+        "  Samples per size: {} n-grams",
+        args.samples.to_formatted_string(&Locale::en)
+    );
     println!(
         "  Total avalanche tests: {} bit flips per hash function",
         ngram_sizes
             .iter()
             .map(|&s| s * 8 * args.samples)
             .sum::<usize>()
+            .to_formatted_string(&Locale::en)
     );
 
     test_hash_functions_tabular(
@@ -974,9 +895,7 @@ fn main() {
     println!("Notes:");
     println!("- Avalanche bias: <0.1% (excellent), <0.5% (very good), <1.0% (good)");
     println!("- Chi²: Lower values indicate better distribution uniformity");
-    println!(
-        "- Integral ⨳: Collisions on random N-byte little-endian uints (only for N ≤ 8)"
-    );
+    println!("- Integral ⨳: Collisions on random N-byte little-endian uints (only for N ≤ 8)");
     println!("  Expected collision ~√(π/2) × √samples by birthday paradox");
     println!("  Uses sample-sized bitset with hash % sample_size mapping");
 }

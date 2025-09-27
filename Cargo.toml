@@ -1,0 +1,44 @@
+[package]
+name = "testhashers"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
+description = "Minimalistic Rust toolkit for hash function quality analysis. Tests avalanche effect, differential patterns, and statistical distribution across variable-length n-grams."
+license = "Apache-2.0"
+repository = "https://github.com/your-username/TestHashers"
+keywords = ["hash", "crypto", "benchmark", "avalanche", "testing"]
+categories = ["algorithms", "cryptography", "development-tools"]
+readme = "README.md"
+
+[[bin]]
+name = "testhashers"
+path = "main.rs"
+
+[dependencies]
+# Random number generation
+rand = "0.9"
+rand_chacha = "0.9"
+
+# Hash functions
+ahash = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+gxhash = "3.5"
+blake3 = "1.8"
+crc32fast = "1.5"
+murmur3 = "0.5"
+cityhash = "0.1"
+stringzilla = "4.0"
+
+# CLI argument parsing
+clap = { version = "4.0", features = ["derive"] }
+
+# Parallelization
+fork_union = "2.2.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+debug = true

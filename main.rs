@@ -45,6 +45,7 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release -- --samples 50000 --ngrams
 mod hash_functions;
 
 use clap::Parser;
+use fork_union as fu;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -197,206 +198,294 @@ impl<'a> Iterator for NGramIterator<'a> {
     }
 }
 
-/// Perform rigorous avalanche analysis using n-grams from continuous buffer
+/// Optimized parallel avalanche analysis using fork_union's for_n
 pub fn test_avalanche<H, F>(
-    hash_fn: F,
-    ngram_length: usize,
-    sample_count: usize,
+    thread_pool: &mut fu::ThreadPool,
+    hash_function: F,
+    ngram_size: usize,
+    num_samples: usize,
 ) -> AvalancheResults
 where
-    H: HashValue,
-    F: Fn(&[u8]) -> H,
+    H: HashValue + Send + Sync,
+    F: Fn(&[u8]) -> H + Send + Sync,
 {
-    // Generate a large buffer and test n-grams
-    let buffer_size = ngram_length + sample_count; // Ensure we have enough n-grams
-    let buffer = generate_test_buffer(buffer_size, 42);
-    let output_bits = H::total_bits() as usize;
+    // Generate test data buffer once
+    let test_buffer_size = ngram_size + num_samples;
+    let test_buffer = generate_test_buffer(test_buffer_size, 42);
+    let num_output_bits = H::total_bits() as usize;
+    let num_input_bits_per_ngram = ngram_size * 8;
 
-    let mut bit_flip_counts = vec![0usize; output_bits];
-    let mut total_tests = 0;
+    // Pre-allocate thread-local resources to avoid contention
+    let num_worker_threads = thread_pool.threads();
+    let mut worker_scratch_buffers: Vec<Vec<u8>> = (0..num_worker_threads)
+        .map(|_| vec![0u8; ngram_size])
+        .collect();
 
-    // Pre-allocate reusable buffer for modified n-grams
-    let mut modified_buffer = vec![0u8; ngram_length];
+    // Thread-local bit flip counters (eliminates atomic contention)
+    let mut worker_bit_flip_counters: Vec<Vec<usize>> = (0..num_worker_threads)
+        .map(|_| vec![0; num_output_bits])
+        .collect();
 
-    // Use iterator to process n-grams without copying
-    for (idx, ngram) in NGramIterator::new(&buffer, ngram_length).enumerate() {
-        if idx >= sample_count {
-            break;
+    // Safety: Each thread accesses only its own dedicated buffer and counter arrays
+    let scratch_buffers_base_ptr = worker_scratch_buffers.as_mut_ptr() as usize;
+    let bit_counters_base_ptr = worker_bit_flip_counters.as_mut_ptr() as usize;
+
+    thread_pool.for_n(num_samples, |worker_context| {
+        let ngram_start_index = worker_context.task_index;
+        let worker_thread_id = worker_context.thread_index;
+
+        // Early return for out-of-bounds samples
+        if ngram_start_index + ngram_size > test_buffer.len() {
+            return;
         }
 
-        let original_hash = hash_fn(ngram);
-        let total_input_bits = ngram_length * 8;
+        let current_ngram = &test_buffer[ngram_start_index..ngram_start_index + ngram_size];
+        let baseline_hash = hash_function(current_ngram);
 
-        // Test flipping each input bit
-        for bit_pos in 0..total_input_bits {
-            let byte_idx = bit_pos / 8;
-            let bit_idx = bit_pos % 8;
+        // Get thread-local resources (zero contention)
+        let scratch_buffer =
+            unsafe { &mut *(scratch_buffers_base_ptr as *mut Vec<u8>).add(worker_thread_id) };
+        let bit_flip_counters =
+            unsafe { &mut *(bit_counters_base_ptr as *mut Vec<usize>).add(worker_thread_id) };
 
-            // Copy to reusable buffer and flip bit
-            modified_buffer.copy_from_slice(ngram);
-            modified_buffer[byte_idx] ^= 1 << bit_idx;
+        // Test each input bit flip for avalanche effect
+        for input_bit_position in 0..num_input_bits_per_ngram {
+            let target_byte_index = input_bit_position / 8;
+            let target_bit_index = input_bit_position % 8;
 
-            let modified_hash = hash_fn(&modified_buffer);
-            let xor_result = original_hash.xor(modified_hash);
+            // Create modified n-gram with single bit flipped
+            scratch_buffer.copy_from_slice(current_ngram);
+            scratch_buffer[target_byte_index] ^= 1 << target_bit_index;
 
-            // Count which output bits flipped
-            for output_bit in 0..output_bits {
-                if (xor_result.to_u64() >> output_bit) & 1 == 1 {
-                    bit_flip_counts[output_bit] += 1;
+            let perturbed_hash = hash_function(scratch_buffer);
+            let hash_difference = baseline_hash.xor(perturbed_hash);
+            let difference_bits = hash_difference.to_u64();
+
+            // Count affected output bits (thread-local, no contention)
+            for output_bit_position in 0..num_output_bits {
+                if (difference_bits >> output_bit_position) & 1 == 1 {
+                    bit_flip_counters[output_bit_position] += 1;
                 }
             }
+        }
+    });
 
-            total_tests += 1;
+    // Aggregate results from all worker threads
+    let mut total_bit_flip_counts = vec![0usize; num_output_bits];
+
+    for worker_counters in &worker_bit_flip_counters {
+        for (output_bit_index, &flip_count) in worker_counters.iter().enumerate() {
+            total_bit_flip_counts[output_bit_index] += flip_count;
         }
     }
 
-    // Calculate per-bit statistics
-    let per_bit_scores: Vec<f64> = bit_flip_counts
+    // Calculate total avalanche tests performed
+    let valid_ngram_count = num_samples.min(test_buffer.len().saturating_sub(ngram_size - 1));
+    let total_avalanche_tests = valid_ngram_count * num_input_bits_per_ngram;
+
+    // Calculate avalanche percentages for each output bit
+    let avalanche_percentages: Vec<f64> = total_bit_flip_counts
         .iter()
-        .map(|&count| (count as f64 / total_tests as f64) * 100.0)
+        .map(|&flip_count| (flip_count as f64 / total_avalanche_tests as f64) * 100.0)
         .collect();
 
-    let average_avalanche = per_bit_scores.iter().sum::<f64>() / output_bits as f64;
+    let mean_avalanche_percentage =
+        avalanche_percentages.iter().sum::<f64>() / num_output_bits as f64;
 
-    // Calculate bias (deviation from ideal 50%)
-    let biases: Vec<f64> = per_bit_scores
+    // Calculate bias from ideal 50% avalanche
+    let bias_values: Vec<f64> = avalanche_percentages
         .iter()
-        .map(|&score| (score - 50.0).abs())
+        .map(|&percentage| (percentage - 50.0).abs())
         .collect();
 
-    let worst_bias = biases.iter().fold(0.0f64, |a, &b| a.max(b));
-    let best_bias = biases.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-
-    // Calculate variance
-    let mean = average_avalanche;
-    let variance = per_bit_scores
+    let maximum_bias = bias_values.iter().fold(0.0f64, |acc, &bias| acc.max(bias));
+    let minimum_bias = bias_values
         .iter()
-        .map(|score| (score - mean).powi(2))
+        .fold(f64::INFINITY, |acc, &bias| acc.min(bias));
+
+    // Calculate variance in avalanche across output bits
+    let avalanche_variance = avalanche_percentages
+        .iter()
+        .map(|percentage| (percentage - mean_avalanche_percentage).powi(2))
         .sum::<f64>()
-        / output_bits as f64;
+        / num_output_bits as f64;
 
     AvalancheResults {
-        average_avalanche,
-        worst_bias,
-        best_bias,
-        variance,
-        per_bit_scores,
-        total_tests,
+        average_avalanche: mean_avalanche_percentage,
+        worst_bias: maximum_bias,
+        best_bias: minimum_bias,
+        variance: avalanche_variance,
+        per_bit_scores: avalanche_percentages,
+        total_tests: total_avalanche_tests,
     }
 }
 
-/// Test differential patterns using n-grams
+/// Optimized parallel differential pattern analysis
 pub fn test_differential<H, F>(
-    hash_fn: F,
-    ngram_length: usize,
-    diff_bits: usize,
-    sample_count: usize,
+    thread_pool: &mut fu::ThreadPool,
+    hash_function: F,
+    ngram_size: usize,
+    num_bits_to_flip: usize,
+    num_samples: usize,
 ) -> DifferentialResults
 where
-    H: HashValue,
-    F: Fn(&[u8]) -> H,
+    H: HashValue + Send + Sync,
+    F: Fn(&[u8]) -> H + Send + Sync,
 {
-    // Generate buffer and pre-allocate modified buffer
-    let buffer_size = ngram_length + sample_count;
-    let buffer = generate_test_buffer(buffer_size, 123);
-    let mut modified_buffer = vec![0u8; ngram_length];
-    let mut collision_count = 0;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // Test differential patterns on n-grams
-    for (idx, ngram) in NGramIterator::new(&buffer, ngram_length).enumerate() {
-        if idx >= sample_count {
-            break;
+    // Generate test data buffer once
+    let test_buffer_size = ngram_size + num_samples;
+    let test_buffer = generate_test_buffer(test_buffer_size, 123);
+
+    // Pre-allocate thread-local scratch buffers
+    let num_worker_threads = thread_pool.threads();
+    let mut worker_scratch_buffers: Vec<Vec<u8>> = (0..num_worker_threads)
+        .map(|_| vec![0u8; ngram_size])
+        .collect();
+
+    // Atomic collision counter (thread-safe)
+    let collision_counter = AtomicUsize::new(0);
+
+    // Safety: Each thread accesses only its own dedicated buffer
+    let scratch_buffers_base_ptr = worker_scratch_buffers.as_mut_ptr() as usize;
+
+    thread_pool.for_n(num_samples, |worker_context| {
+        let ngram_start_index = worker_context.task_index;
+        let worker_thread_id = worker_context.thread_index;
+
+        // Early return for out-of-bounds samples
+        if ngram_start_index + ngram_size > test_buffer.len() {
+            return;
         }
 
-        let hash1 = hash_fn(ngram);
+        let current_ngram = &test_buffer[ngram_start_index..ngram_start_index + ngram_size];
+        let baseline_hash = hash_function(current_ngram);
 
-        // Create a variant with exactly diff_bits flipped
-        modified_buffer.copy_from_slice(ngram);
+        // Get thread-local scratch buffer
+        let scratch_buffer =
+            unsafe { &mut *(scratch_buffers_base_ptr as *mut Vec<u8>).add(worker_thread_id) };
 
-        // For simplicity, flip the first diff_bits bits
-        for bit_idx in 0..diff_bits {
-            let byte_idx = bit_idx / 8;
-            let bit_pos = bit_idx % 8;
-            if byte_idx < ngram_length {
-                modified_buffer[byte_idx] ^= 1 << bit_pos;
+        // Create variant with specified number of bits flipped
+        scratch_buffer.copy_from_slice(current_ngram);
+
+        // Flip the first num_bits_to_flip bits
+        for bit_index in 0..num_bits_to_flip {
+            let target_byte_index = bit_index / 8;
+            let target_bit_index = bit_index % 8;
+            if target_byte_index < ngram_size {
+                scratch_buffer[target_byte_index] ^= 1 << target_bit_index;
             }
         }
 
-        let hash2 = hash_fn(&modified_buffer);
+        let perturbed_hash = hash_function(scratch_buffer);
 
-        if hash1 == hash2 {
-            collision_count += 1;
+        // Check for collision (thread-safe)
+        if baseline_hash == perturbed_hash {
+            collision_counter.fetch_add(1, Ordering::Relaxed);
         }
-    }
+    });
 
-    // Calculate expected collision rate
+    let total_collisions = collision_counter.load(Ordering::Relaxed);
+
+    // Calculate expected collision rate based on hash space size
     let hash_space_size = 2.0_f64.powi(H::total_bits() as i32);
-    let expected_collisions = (sample_count as f64) / hash_space_size;
-    let collision_ratio = collision_count as f64 / expected_collisions.max(1e-10);
+    let expected_collision_rate = (num_samples as f64) / hash_space_size;
+    let collision_ratio = total_collisions as f64 / expected_collision_rate.max(1e-10);
 
     DifferentialResults {
-        expected_collisions,
-        actual_collisions: collision_count,
+        expected_collisions: expected_collision_rate,
+        actual_collisions: total_collisions,
         collision_ratio,
-        worst_pattern: None, // TODO: Track which bit patterns cause most collisions
-        total_tests: sample_count,
+        worst_pattern: None, // Could be enhanced to track problematic bit patterns
+        total_tests: num_samples,
     }
 }
 
-/// Test distribution uniformity using n-grams
+/// Optimized parallel distribution uniformity analysis
 pub fn test_distribution<H, F>(
-    hash_fn: F,
-    ngram_length: usize,
-    sample_count: usize,
-    bucket_count: usize,
+    thread_pool: &mut fu::ThreadPool,
+    hash_function: F,
+    ngram_size: usize,
+    num_samples: usize,
+    num_buckets: usize,
 ) -> DistributionResults
 where
-    H: HashValue,
-    F: Fn(&[u8]) -> H,
+    H: HashValue + Send + Sync,
+    F: Fn(&[u8]) -> H + Send + Sync,
 {
-    // Generate buffer for n-grams
-    let buffer_size = ngram_length + sample_count;
-    let buffer = generate_test_buffer(buffer_size, 789);
-    let mut buckets = vec![0usize; bucket_count];
+    // Generate test data buffer once
+    let test_buffer_size = ngram_size + num_samples;
+    let test_buffer = generate_test_buffer(test_buffer_size, 789);
 
-    // Hash n-grams and distribute into buckets
-    for (idx, ngram) in NGramIterator::new(&buffer, ngram_length).enumerate() {
-        if idx >= sample_count {
-            break;
+    // Pre-allocate thread-local bucket counters to avoid contention
+    let num_worker_threads = thread_pool.threads();
+    let mut worker_bucket_counters: Vec<Vec<usize>> = (0..num_worker_threads)
+        .map(|_| vec![0; num_buckets])
+        .collect();
+
+    // Safety: Each thread accesses only its own dedicated counter array
+    let bucket_counters_base_ptr = worker_bucket_counters.as_mut_ptr() as usize;
+
+    thread_pool.for_n(num_samples, |worker_context| {
+        let ngram_start_index = worker_context.task_index;
+        let worker_thread_id = worker_context.thread_index;
+
+        // Early return for out-of-bounds samples
+        if ngram_start_index + ngram_size > test_buffer.len() {
+            return;
         }
 
-        let hash = hash_fn(ngram);
-        let bucket = (hash.to_u64() % bucket_count as u64) as usize;
-        buckets[bucket] += 1;
+        let current_ngram = &test_buffer[ngram_start_index..ngram_start_index + ngram_size];
+        let hash_value = hash_function(current_ngram);
+
+        // Get thread-local bucket counters (zero contention)
+        let bucket_counters =
+            unsafe { &mut *(bucket_counters_base_ptr as *mut Vec<usize>).add(worker_thread_id) };
+
+        // Distribute hash into appropriate bucket
+        let target_bucket = (hash_value.to_u64() % num_buckets as u64) as usize;
+        bucket_counters[target_bucket] += 1;
+    });
+
+    // Aggregate results from all worker threads
+    let mut total_bucket_counts = vec![0usize; num_buckets];
+
+    for worker_counters in &worker_bucket_counters {
+        for (bucket_index, &count) in worker_counters.iter().enumerate() {
+            total_bucket_counts[bucket_index] += count;
+        }
     }
 
-    // Calculate chi-square statistic
-    let expected = sample_count as f64 / bucket_count as f64;
-    let chi_square: f64 = buckets
+    // Calculate chi-square statistic for uniformity test
+    let expected_count_per_bucket = num_samples as f64 / num_buckets as f64;
+    let chi_square_statistic: f64 = total_bucket_counts
         .iter()
-        .map(|&observed| {
-            let diff = observed as f64 - expected;
-            (diff * diff) / expected
+        .map(|&observed_count| {
+            let deviation = observed_count as f64 - expected_count_per_bucket;
+            (deviation * deviation) / expected_count_per_bucket
         })
         .sum();
 
-    // Simplified p-value calculation (for large samples, chi-square approaches normal)
-    let degrees_of_freedom = bucket_count - 1;
-    let p_value = 1.0 - (chi_square / degrees_of_freedom as f64).min(1.0);
+    // Simplified p-value calculation (chi-square approximation)
+    let degrees_of_freedom = num_buckets - 1;
+    let p_value_estimate = 1.0 - (chi_square_statistic / degrees_of_freedom as f64).min(1.0);
 
-    // Uniformity score (0-100, higher is better)
-    let max_deviation = buckets
+    // Calculate uniformity score (0-100, higher = more uniform)
+    let maximum_relative_deviation = total_bucket_counts
         .iter()
-        .map(|&count| ((count as f64 - expected) / expected).abs())
-        .fold(0.0f64, |a, b| a.max(b));
+        .map(|&count| {
+            ((count as f64 - expected_count_per_bucket) / expected_count_per_bucket).abs()
+        })
+        .fold(0.0f64, |acc, deviation| acc.max(deviation));
 
-    let uniformity_score = ((1.0 - max_deviation.min(1.0)) * 100.0).max(0.0);
+    let uniformity_percentage = ((1.0 - maximum_relative_deviation.min(1.0)) * 100.0).max(0.0);
 
     DistributionResults {
-        chi_square,
-        p_value,
-        uniformity_score,
-        bucket_count,
+        chi_square: chi_square_statistic,
+        p_value: p_value_estimate,
+        uniformity_score: uniformity_percentage,
+        bucket_count: num_buckets,
     }
 }
 
@@ -405,6 +494,7 @@ fn test_hash_functions_tabular(
     hash_functions: &[Box<dyn HashFunction>],
     ngram_sizes: &[usize],
     samples_per_size: usize,
+    verbose: bool,
 ) {
     // Collect results for all hash functions and n-gram sizes
     struct TestResult {
@@ -418,11 +508,30 @@ fn test_hash_functions_tabular(
 
     let mut all_results = Vec::new();
 
+    // Create thread pool once for all tests
+    let num_cores = fu::count_logical_cores();
+    let mut pool = fu::spawn(num_cores);
+
     for ngram_size in ngram_sizes {
-        println!(
-            "\nTesting {}-grams with {} samples each...",
-            ngram_size, samples_per_size
-        );
+        // Cap samples based on combinatorial space for small n-grams
+        let max_possible_ngrams = if *ngram_size <= 5 {
+            1usize << ngram_size * 8
+        } else {
+            samples_per_size
+        };
+
+        let effective_samples = samples_per_size.min(max_possible_ngrams);
+        if effective_samples < samples_per_size {
+            println!(
+                "\nTesting {}-grams with {} samples (capped from {} - only 2^{} possible combinations) using {} cores",
+                ngram_size, effective_samples, samples_per_size, ngram_size * 8, num_cores
+            );
+        } else {
+            println!(
+                "\nTesting {}-grams with {} samples each... (using {} cores)",
+                ngram_size, effective_samples, num_cores
+            );
+        }
 
         for hash_func in hash_functions {
             print!("  Testing {}...", hash_func.name());
@@ -430,35 +539,89 @@ fn test_hash_functions_tabular(
             // Run tests based on bit width
             let (avalanche, differential, distribution, actual_samples) = if hash_func.bits() == 64
             {
-                let aval = test_avalanche(|d| hash_func.hash(d), *ngram_size, samples_per_size);
-                let diff =
-                    test_differential(|d| hash_func.hash(d), *ngram_size, 1, samples_per_size);
-                let dist = test_distribution(
+                let aval = test_avalanche(
+                    &mut pool,
                     |d| hash_func.hash(d),
                     *ngram_size,
-                    samples_per_size * 10,
+                    effective_samples,
+                );
+                let diff = test_differential(
+                    &mut pool,
+                    |d| hash_func.hash(d),
+                    *ngram_size,
+                    1,
+                    effective_samples,
+                );
+                let dist = test_distribution(
+                    &mut pool,
+                    |d| hash_func.hash(d),
+                    *ngram_size,
+                    effective_samples * 10,
                     1024,
                 );
-                let samples = samples_per_size.min(dist.bucket_count * 10); // Actual samples tested
+                let samples = effective_samples.min(dist.bucket_count * 10); // Actual samples tested
                 (aval, diff, dist, samples)
             } else {
-                let aval =
-                    test_avalanche(|d| hash_func.hash(d) as u32, *ngram_size, samples_per_size);
+                let aval = test_avalanche(
+                    &mut pool,
+                    |d| hash_func.hash(d) as u32,
+                    *ngram_size,
+                    effective_samples,
+                );
                 let diff = test_differential(
+                    &mut pool,
                     |d| hash_func.hash(d) as u32,
                     *ngram_size,
                     1,
-                    samples_per_size,
+                    effective_samples,
                 );
                 let dist = test_distribution(
+                    &mut pool,
                     |d| hash_func.hash(d) as u32,
                     *ngram_size,
-                    samples_per_size * 10,
+                    effective_samples * 10,
                     1024,
                 );
-                let samples = samples_per_size.min(dist.bucket_count * 10);
+                let samples = effective_samples.min(dist.bucket_count * 10);
                 (aval, diff, dist, samples)
             };
+
+            // Show detailed stats immediately if verbose mode
+            if verbose {
+                // Find best and worst performing bits
+                let best_bit = avalanche
+                    .per_bit_scores
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| (a.1 - 50.0).abs().partial_cmp(&(b.1 - 50.0).abs()).unwrap())
+                    .unwrap();
+                let worst_bit = avalanche
+                    .per_bit_scores
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| (a.1 - 50.0).abs().partial_cmp(&(b.1 - 50.0).abs()).unwrap())
+                    .unwrap();
+
+                println!(" done");
+                println!(
+                    "    └─ Avalanche: avg={:.2}%, worst_bias={:.3}%, variance={:.2}",
+                    avalanche.average_avalanche, avalanche.worst_bias, avalanche.variance
+                );
+                println!(
+                    "    └─ Best bit {}: {:.2}%, Worst bit {}: {:.2}%",
+                    best_bit.0, best_bit.1, worst_bit.0, worst_bit.1
+                );
+                println!(
+                    "    └─ Distribution: score={:.1}%, chi²={:.1}",
+                    distribution.uniformity_score, distribution.chi_square
+                );
+                println!(
+                    "    └─ Differential: {} collisions (expected {:.2})",
+                    differential.actual_collisions, differential.expected_collisions
+                );
+            } else {
+                println!(" done");
+            }
 
             all_results.push(TestResult {
                 hash_name: hash_func.name().to_string(),
@@ -468,8 +631,6 @@ fn test_hash_functions_tabular(
                 distribution_score: distribution.uniformity_score,
                 ngrams_tested: actual_samples,
             });
-
-            println!(" done");
         }
     }
 
@@ -578,6 +739,10 @@ struct Args {
     /// N-gram sizes to test (comma-separated)
     #[arg(long = "ngrams", default_value = "3,4,8,16,32,64,128")]
     ngram_sizes_str: String,
+
+    /// Show detailed statistics for each individual test
+    #[arg(long = "verbose", short = 'v')]
+    verbose: bool,
 }
 
 fn parse_ngram_sizes(s: &str) -> Result<Vec<usize>, String> {
@@ -646,7 +811,7 @@ fn main() {
             .sum::<usize>()
     );
 
-    test_hash_functions_tabular(&hash_functions, &ngram_sizes, args.samples);
+    test_hash_functions_tabular(&hash_functions, &ngram_sizes, args.samples, args.verbose);
 
     println!("\nNotes:");
     println!("- Avalanche bias: <0.1% (excellent), <0.5% (very good), <1.0% (good)");

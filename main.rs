@@ -21,7 +21,7 @@ by systematically testing how input bit patterns affect output distribution.
 RUSTFLAGS="-C target-cpu=native" cargo run --release
 
 # Stress test all hash functions extensively
-RUSTFLAGS="-C target-cpu=native" cargo run --release -- --samples 10_000_000_000
+RUSTFLAGS="-C target-cpu=native" cargo run --release -- --samples 1000000
 
 # Test specific hash functions
 RUSTFLAGS="-C target-cpu=native" cargo run --release -- --hash gxhash --hash xxhash3
@@ -49,7 +49,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::Parser;
 use fork_union as fu;
-use num_format::{Locale, ToFormattedString};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
@@ -61,6 +60,18 @@ use tabled::{
 use hash_functions::{
     get_all_hash_functions, get_available_hash_names, get_hash_functions_by_names, HashFunction,
 };
+
+fn format_thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push('\'');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
 
 /// Trait for hash values that can be analyzed for quality
 pub trait HashValue: Copy + PartialEq + std::fmt::Debug {
@@ -457,6 +468,7 @@ struct TestResult {
     #[tabled(rename = "Chi²")]
     avg_chi_square_display: String,
     #[serde(rename = "total_collisions")]
+    #[tabled(skip)]
     total_collisions: usize,
     #[serde(skip)]
     #[tabled(skip)]
@@ -499,7 +511,7 @@ fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult>
             hash_name,
             avg_bias_display: format!("{:.5}%", avg_bias),
             worst_bias_display: format!("{:.5}%", worst_bias),
-            total_collisions_display: total_collisions_sum.to_formatted_string(&Locale::en),
+            total_collisions_display: format_thousands(total_collisions_sum),
             avg_chi_square_display: format!("{:.3}", avg_chi_square),
             total_collisions: total_collisions_sum,
             avg_bias,
@@ -552,13 +564,13 @@ fn test_hash_functions_tabular(
         if effective_samples < samples_per_size {
             println!(
                 "\nTesting {}-grams with {} samples (capped from {} - only 2^{} possible combinations) using {} cores",
-                ngram_size, effective_samples.to_formatted_string(&Locale::en), samples_per_size.to_formatted_string(&Locale::en), ngram_size * 8, num_cores
+                ngram_size, format_thousands(effective_samples), format_thousands(samples_per_size), ngram_size * 8, num_cores
             );
         } else {
             println!(
                 "\nTesting {}-grams with {} samples each... (using {} cores)",
                 ngram_size,
-                effective_samples.to_formatted_string(&Locale::en),
+                format_thousands(effective_samples),
                 num_cores
             );
         }
@@ -646,22 +658,22 @@ fn test_hash_functions_tabular(
                             Some(pos) => {
                                 println!(
                                 "    └─ Integral ⨳: {} collisions, first at {} (expected at ~{})",
-                                collisions.total_collisions.to_formatted_string(&Locale::en),
-                                pos.to_formatted_string(&Locale::en),
-                                collisions.expected_collision_at.to_formatted_string(&Locale::en)
+                                format_thousands(collisions.total_collisions),
+                                format_thousands(pos),
+                                format_thousands(collisions.expected_collision_at)
                             )
                             }
                             None => {
                                 println!(
                                     "    └─ Integral ⨳: {} collisions",
-                                    collisions.total_collisions.to_formatted_string(&Locale::en)
+                                    format_thousands(collisions.total_collisions)
                                 )
                             }
                         }
                     } else {
                         println!(
                             "    └─ Integral ⨳: No collisions in {} samples",
-                            collisions.total_tests.to_formatted_string(&Locale::en)
+                            format_thousands(collisions.total_tests)
                         );
                     }
                 } else {
@@ -674,7 +686,7 @@ fn test_hash_functions_tabular(
             let (total_collisions, collision_display, total_collisions_count) =
                 if let Some(collisions) = &collisions_opt {
                     let display = match collisions.first_collision_at {
-                        Some(pos) => format!("@{}", pos.to_formatted_string(&Locale::en)),
+                        Some(pos) => format!("@{}", format_thousands(pos)),
                         None => "None".to_string(),
                     };
                     (
@@ -872,15 +884,15 @@ fn main() {
     println!("  N-gram sizes: {:?} bytes", ngram_sizes);
     println!(
         "  Samples per size: {} n-grams",
-        args.samples.to_formatted_string(&Locale::en)
+        format_thousands(args.samples)
     );
+    let total_tests = ngram_sizes
+        .iter()
+        .map(|&s| s * 8 * args.samples)
+        .sum::<usize>();
     println!(
         "  Total avalanche tests: {} bit flips per hash function",
-        ngram_sizes
-            .iter()
-            .map(|&s| s * 8 * args.samples)
-            .sum::<usize>()
-            .to_formatted_string(&Locale::en)
+        format_thousands(total_tests)
     );
 
     test_hash_functions_tabular(

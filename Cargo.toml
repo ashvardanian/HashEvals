@@ -28,6 +28,10 @@ crc32fast = "1.5"
 blake3 = "1.8"
 murmur3 = "0.5"
 cityhash = "0.1"
+adler = "1.0"
+fxhash = "0.2"
+foldhash = "0.2"
+seahash = "4.1"
 
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive"] }

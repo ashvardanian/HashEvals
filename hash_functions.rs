@@ -1,4 +1,5 @@
 use ahash::RandomState as AHashState;
+use fxhash::FxBuildHasher;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::Cursor;
@@ -172,6 +173,114 @@ impl HashFunction for Blake3Function {
     }
 }
 
+/// Adler32 function
+pub struct AdlerFunction;
+
+impl HashFunction for AdlerFunction {
+    fn name(&self) -> &'static str {
+        "Adler32"
+    }
+    fn bits(&self) -> u32 {
+        32
+    }
+    fn hash(&self, data: &[u8]) -> u64 {
+        adler::adler32_slice(data) as u64
+    }
+}
+
+/// FxHash function
+pub struct FxHashFunction {
+    builder: FxBuildHasher,
+}
+
+impl FxHashFunction {
+    pub fn new() -> Self {
+        Self {
+            builder: FxBuildHasher::default(),
+        }
+    }
+}
+
+impl HashFunction for FxHashFunction {
+    fn name(&self) -> &'static str {
+        "FxHash"
+    }
+    fn bits(&self) -> u32 {
+        64
+    }
+    fn hash(&self, data: &[u8]) -> u64 {
+        self.builder.hash_one(data)
+    }
+}
+
+/// FoldHash function
+pub struct FoldHashFunction {
+    builder: foldhash::fast::RandomState,
+}
+
+impl FoldHashFunction {
+    pub fn new() -> Self {
+        Self {
+            builder: foldhash::fast::RandomState::default(),
+        }
+    }
+}
+
+impl HashFunction for FoldHashFunction {
+    fn name(&self) -> &'static str {
+        "FoldHash"
+    }
+    fn bits(&self) -> u32 {
+        64
+    }
+    fn hash(&self, data: &[u8]) -> u64 {
+        self.builder.hash_one(data)
+    }
+}
+
+/// SeaHash function
+pub struct SeaHashFunction;
+
+impl HashFunction for SeaHashFunction {
+    fn name(&self) -> &'static str {
+        "SeaHash"
+    }
+    fn bits(&self) -> u32 {
+        64
+    }
+    fn hash(&self, data: &[u8]) -> u64 {
+        seahash::hash(data)
+    }
+}
+
+/// Classical 32-bit Karp-Rabin rolling hash (base 256 modulo prime)
+pub struct RabinKarp32Function;
+
+impl RabinKarp32Function {
+    const BASE: u64 = 256;
+    const MODULUS: u64 = 1_000_000_007; // large prime commonly used for Rabin-Karp
+
+    fn compute(data: &[u8]) -> u32 {
+        let mut acc = 0u64;
+        for &byte in data {
+            acc = (acc * Self::BASE + byte as u64) % Self::MODULUS;
+        }
+        acc as u32
+    }
+}
+
+impl HashFunction for RabinKarp32Function {
+    fn name(&self) -> &'static str {
+        "RabinKarp32"
+    }
+    fn bits(&self) -> u32 {
+        32
+    }
+    fn hash(&self, data: &[u8]) -> u64 {
+        Self::compute(data) as u64
+    }
+}
+
 /// Get all available hash functions
 pub fn get_all_hash_functions() -> Vec<Box<dyn HashFunction>> {
     vec![
@@ -184,6 +293,11 @@ pub fn get_all_hash_functions() -> Vec<Box<dyn HashFunction>> {
         Box::new(Murmur3Function),
         Box::new(CityHashFunction),
         Box::new(Blake3Function),
+        Box::new(AdlerFunction),
+        Box::new(FxHashFunction::new()),
+        Box::new(FoldHashFunction::new()),
+        Box::new(SeaHashFunction),
+        Box::new(RabinKarp32Function),
     ]
 }
 

@@ -17,11 +17,11 @@ by systematically testing how input bit patterns affect output distribution.
 ## Usage
 
 ```sh
-# Test all hash functions
-RUSTFLAGS="-C target-cpu=native" cargo run --release
+# Make sure everything compiles and logs are shown
+RUSTFLAGS="-C target-cpu=native" cargo run --release --samples 100 --verbose
 
-# Stress test all hash functions extensively
-RUSTFLAGS="-C target-cpu=native" cargo run --release -- --samples 1000000
+# Stress-test all hash functions, outputting also to file... will take a while
+time RUSTFLAGS="-C target-cpu=native" cargo run --release 2>&1 | tee results.txt
 
 # Test specific hash functions
 RUSTFLAGS="-C target-cpu=native" cargo run --release -- --hash gxhash --hash xxhash3
@@ -71,6 +71,81 @@ fn format_thousands(n: usize) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+fn format_duration(duration_ms: u64) -> String {
+    if duration_ms < 1000 {
+        format!("{}ms", format_thousands(duration_ms as usize))
+    } else if duration_ms < 60_000 {
+        format!("{:.1}s", duration_ms as f64 / 1000.0)
+    } else {
+        let total_seconds = duration_ms / 1000;
+        let minutes = total_seconds / 60;
+        let seconds = total_seconds % 60;
+        format!("{}m {}s", format_thousands(minutes as usize), seconds)
+    }
+}
+
+fn find_bias_leaders(results: &[&DetailedTestResult]) -> String {
+    if results.is_empty() {
+        return "N/A".to_string();
+    }
+
+    // Find the best (lowest) bias
+    let best_bias = results
+        .iter()
+        .map(|r| r.avalanche_bias)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap();
+
+    // Find all results that have the best bias (ties)
+    let leaders: Vec<String> = results
+        .iter()
+        .filter(|r| (r.avalanche_bias - best_bias).abs() < 1e-10) // Handle floating point precision
+        .map(|r| r.hash_name.clone())
+        .collect();
+
+    leaders.join(", ")
+}
+
+fn find_speed_leaders(results: &[&DetailedTestResult]) -> String {
+    if results.is_empty() {
+        return "N/A".to_string();
+    }
+
+    // Find the best (lowest) duration
+    let best_duration = results.iter().map(|r| r.duration_ms).min().unwrap();
+
+    // Find all results that have the best duration (ties)
+    let leaders: Vec<String> = results
+        .iter()
+        .filter(|r| r.duration_ms == best_duration)
+        .map(|r| r.hash_name.clone())
+        .collect();
+
+    leaders.join(", ")
+}
+
+fn find_collision_leaders(results: &[&DetailedTestResult]) -> String {
+    if results.is_empty() {
+        return "N/A".to_string();
+    }
+
+    // Find the best (lowest) collision count
+    let best_collisions = results
+        .iter()
+        .map(|r| r.total_collisions_count)
+        .min()
+        .unwrap();
+
+    // Find all results that have the best collision count (ties)
+    let leaders: Vec<String> = results
+        .iter()
+        .filter(|r| r.total_collisions_count == best_collisions)
+        .map(|r| r.hash_name.clone())
+        .collect();
+
+    leaders.join(", ")
 }
 
 /// Trait for hash values that can be analyzed for quality
@@ -452,6 +527,9 @@ struct DetailedTestResult {
     #[serde(skip)]
     #[tabled(skip)]
     total_collisions_count: usize,
+    #[serde(rename = "duration_ms")]
+    #[tabled(skip)]
+    duration_ms: u64,
 }
 
 /// Aggregated test result for main summary table and CSV export
@@ -467,9 +545,14 @@ struct TestResult {
     total_collisions_display: String,
     #[tabled(rename = "Chi²")]
     avg_chi_square_display: String,
+    #[tabled(rename = "Duration")]
+    duration_display: String,
     #[serde(rename = "total_collisions")]
     #[tabled(skip)]
     total_collisions: usize,
+    #[serde(rename = "duration_ms")]
+    #[tabled(skip)]
+    duration_ms: u64,
     #[serde(skip)]
     #[tabled(skip)]
     avg_bias: f64,
@@ -507,13 +590,18 @@ fn aggregate_results(detailed_results: &[DetailedTestResult]) -> Vec<TestResult>
             .map(|r| r.total_collisions_count)
             .sum::<usize>();
 
+        // Sum total duration across all n-gram sizes
+        let total_duration_ms = results.iter().map(|r| r.duration_ms).sum::<u64>();
+
         aggregated.push(TestResult {
             hash_name,
             avg_bias_display: format!("{:.5}%", avg_bias),
             worst_bias_display: format!("{:.5}%", worst_bias),
             total_collisions_display: format_thousands(total_collisions_sum),
             avg_chi_square_display: format!("{:.3}", avg_chi_square),
+            duration_display: format_duration(total_duration_ms),
             total_collisions: total_collisions_sum,
+            duration_ms: total_duration_ms,
             avg_bias,
         });
     }
@@ -577,6 +665,9 @@ fn test_hash_functions_tabular(
 
         for hash_func in hash_functions {
             print!("  Testing {}...", hash_func.name());
+
+            // Start timing
+            let start_time = std::time::Instant::now();
 
             // Run tests based on bit width
             let (avalanche, collisions_opt, distribution, actual_samples) =
@@ -698,6 +789,9 @@ fn test_hash_functions_tabular(
                     (0, "N/A".to_string(), 0)
                 };
 
+            // Calculate test duration
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+
             detailed_results.push(DetailedTestResult {
                 hash_name: hash_func.name().to_string(),
                 ngram_size: *ngram_size,
@@ -709,6 +803,7 @@ fn test_hash_functions_tabular(
                 avalanche_bias: avalanche.worst_bias,
                 distribution_score: distribution.chi_square,
                 total_collisions_count,
+                duration_ms,
             });
         }
     }
@@ -724,7 +819,7 @@ fn test_hash_functions_tabular(
     let table = Table::new(&aggregated_results)
         .with(Style::psql())
         .modify(
-            tabled::settings::object::Columns::new(1..5),
+            tabled::settings::object::Columns::new(1..6),
             Alignment::right(),
         )
         .to_string();
@@ -738,19 +833,17 @@ fn test_hash_functions_tabular(
         }
     }
 
-    // Summary statistics by n-gram size
+    // Leaders by n-gram size
     #[derive(Debug, Serialize, Deserialize, Tabled)]
     struct NGramSummary {
         #[tabled(rename = "N-gram")]
         ngram_size: usize,
-        #[tabled(rename = "Best Function")]
-        best_function: String,
-        #[tabled(rename = "Best Bias")]
-        best_bias: String,
-        #[tabled(rename = "Worst Function")]
-        worst_function: String,
-        #[tabled(rename = "Worst Bias")]
-        worst_bias: String,
+        #[tabled(rename = "Lowest Bias")]
+        lowest_bias_leaders: String,
+        #[tabled(rename = "Highest Speed")]
+        highest_speed_leaders: String,
+        #[tabled(rename = "Lowest Collisions")]
+        lowest_collisions_leaders: String,
     }
 
     let mut ngram_summaries = Vec::new();
@@ -762,27 +855,17 @@ fn test_hash_functions_tabular(
             .collect();
 
         if !size_results.is_empty() {
-            let best = size_results
-                .iter()
-                .min_by(|a, b| a.avalanche_bias.partial_cmp(&b.avalanche_bias).unwrap())
-                .unwrap();
-            let worst = size_results
-                .iter()
-                .max_by(|a, b| a.avalanche_bias.partial_cmp(&b.avalanche_bias).unwrap())
-                .unwrap();
-
             ngram_summaries.push(NGramSummary {
                 ngram_size: *ngram_size,
-                best_function: best.hash_name.clone(),
-                best_bias: format!("{:.5}%", best.avalanche_bias),
-                worst_function: worst.hash_name.clone(),
-                worst_bias: format!("{:.5}%", worst.avalanche_bias),
+                lowest_bias_leaders: find_bias_leaders(&size_results),
+                highest_speed_leaders: find_speed_leaders(&size_results),
+                lowest_collisions_leaders: find_collision_leaders(&size_results),
             });
         }
     }
 
     println!();
-    println!("Summary by N-gram size:");
+    println!("Leaders by N-gram size:");
     println!();
     let summary_table = Table::new(&ngram_summaries)
         .with(Style::psql())
@@ -809,11 +892,14 @@ struct Args {
     list_hashes: bool,
 
     /// Number of samples per n-gram size
-    #[arg(long = "samples", default_value = "10000")]
+    #[arg(long = "samples", default_value = "1000000")]
     samples: usize,
 
     /// N-gram sizes to test (comma-separated)
-    #[arg(long = "ngrams", default_value = "3,4,8,16,32,64,128")]
+    #[arg(
+        long = "ngrams",
+        default_value = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"
+    )]
     ngram_sizes_str: String,
 
     /// Show detailed statistics for each individual test

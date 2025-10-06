@@ -1,6 +1,6 @@
-# HashEvals
+[![HashEvals](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/HashEvals.jpg?raw=true)](https://github.com/ashvardanian/HashEvals)
 
-HashEvals is a Rust program that stress-tests hash functions for avalanche quality, integral collisions, and distribution skew across variable-length n-grams.
+__HashEvals__ is a Rust program that stress-tests hash functions for avalanche quality, integral collisions, and distribution skew across variable-length n-grams.
 The suite draws inspiration from the SMHasher family of benchmarks while keeping a lean codebase that is easy to extend with new hash primitives.
 
 What It Tests?
